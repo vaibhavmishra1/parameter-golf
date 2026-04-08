@@ -109,12 +109,16 @@ class Hyperparameters():
     # === DEPTH ROPE PARAMS (new) ===
     # Dimensions of head_dim devoted to depth encoding.
     # These are SEPARATE from sequence RoPE dims to avoid interference.
-    # depth_rope_dims should be <= head_dim - rope_dims (unused sequence dims).
-    # With head_dim=64, rope_dims=16: 48 free dims → use 16 for depth.
-    depth_rope_dims = int(os.environ.get('DEPTH_ROPE_DIMS', 16))
-    # Lower base → faster-rotating frequencies → more distinct depth encodings.
-    # For max_depth=4 loops, base=100 gives well-separated rotations.
-    depth_rope_base = float(os.environ.get('DEPTH_ROPE_BASE', 100.0))
+    # depth_rope_dims: head_dim dims dedicated to depth encoding.
+    # Must satisfy: depth_rope_dims <= head_dim - rope_dims (no overlap with seq RoPE).
+    # With head_dim=64, rope_dims=16: 48 free dims available.
+    # Setting 32 uses half the head for depth → strong signal.
+    depth_rope_dims = int(os.environ.get('DEPTH_ROPE_DIMS', 32))
+    # Base controls rotation spread across depth levels.
+    # base=10: θ_0 = 1.0 rad at depth=1, giving ~57° rotation per depth step — very distinct.
+    # base=100: gentler, θ_0 = 1.0 rad but higher dims rotate less.
+    # For only 4 depth levels, use base=10 for maximum separation.
+    depth_rope_base = float(os.environ.get('DEPTH_ROPE_BASE', 10.0))
     # Maximum supported depth (should be >= num_loops + 1).
     max_depth = int(os.environ.get('MAX_DEPTH', 16))
 
@@ -396,44 +400,51 @@ class DepthRotary(nn.Module):
     At depth 0 → identity rotation (cos=1, sin=0 everywhere → no change).
     At depth d > 0 → progressive rotations, differentiating each pass.
 
+    IMPORTANT — non-overlapping dimensions:
+      Sequence RoPE uses head_dim dims [0 : seq_rope_dims].
+      Depth   RoPE uses head_dim dims [seq_rope_dims : seq_rope_dims + depth_rope_dims].
+    This guarantees clean, independent encodings for position and depth.
+    With head_dim=64, seq_rope_dims=16, depth_rope_dims=32:
+      dims [0:16]  → sequence position (sequence RoPE)
+      dims [16:48] → recursion depth   (depth RoPE)   ← 32 dims = 50% of head
+      dims [48:64] → unconstrained attention
+
     Uses a LOW base frequency (default 100 vs 10000 for sequence RoPE) because
     we only have a few depth levels (4-8) vs thousands of sequence positions.
     A lower base spreads the rotations further apart for small d values.
 
     Zero trainable parameters — purely a fixed positional encoding in depth space.
-    Applied to a SEPARATE subset of head_dim dimensions (depth_rope_dims)
-    so it does not interfere with the existing sequence RoPE dimensions.
     """
-    def __init__(self, head_dim: int, max_depth: int = 16,
-                 depth_rope_base: float = 100.0, depth_rope_dims: int = 16):
+    def __init__(self, head_dim: int, seq_rope_dims: int = 16, max_depth: int = 16,
+                 depth_rope_base: float = 100.0, depth_rope_dims: int = 32):
         super().__init__()
-        rdim = min(depth_rope_dims, head_dim)
+        # Start AFTER sequence RoPE dimensions to avoid overlap
+        self.start = seq_rope_dims
+        rdim = min(depth_rope_dims, head_dim - seq_rope_dims)
         self.rdim = rdim
-        # Sinusoidal frequencies — lower base → more spread per depth step
         inv_freq = 1.0 / (depth_rope_base ** (torch.arange(0, rdim, 2, dtype=torch.float32) / rdim))
         depths = torch.arange(max_depth, dtype=torch.float32)
         freqs = torch.outer(depths, inv_freq)      # [max_depth, rdim//2]
-        # Register as non-persistent buffers (not saved to state dict, no parameters)
         self.register_buffer("depth_cos", freqs.cos(), persistent=False)  # [max_depth, rdim//2]
         self.register_buffer("depth_sin", freqs.sin(), persistent=False)  # [max_depth, rdim//2]
 
     def forward(self, x: Tensor, depth_idx: int) -> Tensor:
         """
         Apply depth rotation to attention tensor x: [B, T, H, head_dim].
-        Only the first self.rdim dimensions are rotated; the rest pass through.
-        depth_idx=0 is an identity (cos=1, sin=0) so the no-loop phase is neutral.
+        Rotates dims [seq_rope_dims : seq_rope_dims+rdim], leaving all other dims unchanged.
+        depth_idx=0 is an identity (cos=1, sin=0) — no effect on non-looping passes.
         """
-        rdim = self.rdim
-        # Select the precomputed cos/sin for this depth (compile-time constant)
-        cos = self.depth_cos[depth_idx]   # [rdim//2]
+        rdim = self.rdim; start = self.start
+        cos = self.depth_cos[depth_idx]   # [rdim//2]  — compile-time index
         sin = self.depth_sin[depth_idx]   # [rdim//2]
         half = rdim // 2
-        # Split head dimensions: depth-encoded vs passthrough
-        x_d, x_pass = x[..., :rdim], x[..., rdim:]  # rotate first rdim dims only
+        # Three segments: prefix (seq RoPE range), depth range, suffix
+        x_pre  = x[..., :start]
+        x_d    = x[..., start:start + rdim]
+        x_post = x[..., start + rdim:]
         x1, x2 = x_d[..., :half], x_d[..., half:]
-        # Standard RoPE rotation formula: cos/sin broadcast over [B, T, H]
         x_rotated = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-        return torch.cat([x_rotated, x_pass], dim=-1)
+        return torch.cat([x_pre, x_rotated, x_post], dim=-1)
 
 
 def apply_rotary_emb(x, cos, sin, rope_dims=0):
@@ -467,11 +478,15 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=train_seq_len)
         self.use_xsa = False
 
-        # Depth RoPE: only enabled for blocks that participate in looping
+        # Depth RoPE: only enabled for blocks that participate in looping.
+        # seq_rope_dims tells DepthRotary where sequence RoPE ends so depth
+        # RoPE can start in the NEXT set of dimensions (no overlap).
         self.use_depth_rope = use_depth_rope
         if use_depth_rope:
             self.depth_rotary = DepthRotary(
-                self.head_dim, max_depth=max_depth,
+                self.head_dim,
+                seq_rope_dims=self.rope_dims if self.rope_dims > 0 else self.head_dim,
+                max_depth=max_depth,
                 depth_rope_base=depth_rope_base,
                 depth_rope_dims=depth_rope_dims,
             )
@@ -537,12 +552,20 @@ class Block(nn.Module):
         self.mlp_scale  = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix  = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        # Additive depth embedding: learned vector added to residual stream per depth.
+        # This lets BOTH attention AND MLP condition on depth (not just Q/K rotation).
+        # Only created for looped blocks (use_depth_rope reuses the same flag).
+        # Initialised to zero so it has no effect at the start of training.
+        self.depth_emb = nn.Parameter(torch.zeros(max_depth, dim)) if use_depth_rope else None
 
     def forward(self, x: Tensor, x0: Tensor, depth_idx: int = 0) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # Additive depth signal in residual stream: affects both attn and MLP norms
+        if self.depth_emb is not None:
+            x_in = x_in + self.depth_emb[depth_idx].to(x_in.dtype)[None, None, :]
         normed = self.attn_norm(x_in) * self.ln_scale_factor
-        attn_out = self.attn(normed, depth_idx)   # <-- depth_idx passed here
+        attn_out = self.attn(normed, depth_idx)   # <-- depth_idx also rotates Q/K
         if self.parallel:
             mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor)
             return x_in + self.attn_scale.to(x_in.dtype)[None,None,:] * attn_out \
@@ -594,6 +617,16 @@ class GPT(nn.Module):
                 b.attn.rope_dims = h.rope_dims
                 b.attn.rotary = Rotary(b.attn.head_dim, base=h.rope_base,
                                        train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
+                # Rebuild DepthRotary now that we know the actual seq_rope_dims,
+                # so depth dims start cleanly AFTER sequence dims (no overlap).
+                if in_loop:
+                    b.attn.depth_rotary = DepthRotary(
+                        b.attn.head_dim,
+                        seq_rope_dims=h.rope_dims,
+                        max_depth=h.max_depth,
+                        depth_rope_base=h.depth_rope_base,
+                        depth_rope_dims=h.depth_rope_dims,
+                    )
             return b
 
         self.blocks = nn.ModuleList([make_block(i) for i in range(h.num_layers)])
@@ -748,10 +781,16 @@ class Muon(torch.optim.Optimizer):
 class Optimizers():
     def __init__(self, h, base_model):
         block_named_params = list(base_model.blocks.named_parameters())
+        # depth_emb is [max_depth, dim] (ndim==2) — NOT a weight matrix.
+        # Route it to Adam (scalar_params), not Muon.
         matrix_params = [p for name, p in block_named_params
-                         if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
+                         if p.ndim == 2
+                         and "depth_emb" not in name
+                         and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
         scalar_params  = [p for name, p in block_named_params
-                          if p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
+                          if p.ndim < 2
+                          or "depth_emb" in name
+                          or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
         if base_model.skip_weights.numel() > 0: scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None:   scalar_params.append(base_model.skip_gates)
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
