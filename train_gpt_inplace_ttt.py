@@ -420,7 +420,7 @@ def eval_val_with_ttt(
             # V̂ = normalize(tok_emb[next_tokens])  [NTP-aligned target]
             # ΔW_down = (ttt_lr / T) * V̂.T @ Z
             #   V̂ shape: [T, model_dim=512]
-            #   Z shape:  [T, hidden=1024]
+            #   Z shape:  [n_seqs, chunk_len, hidden] -> reshape to [T, hidden]
             #   ΔW_down:  [model_dim, hidden] = proj.weight shape  ✓
             #
             # This is the "lazy" gradient step (drops the quadratic W_down term),
@@ -435,8 +435,10 @@ def eval_val_with_ttt(
                 for layer_idx, block in enumerate(base_model.blocks):
                     if layer_idx not in z_cache:
                         continue
-                    z = z_cache[layer_idx].float()                  # [T, 1024]
-                    # delta: [512, 1024] matches proj.weight (stored fp32)
+                    # Hook sees proj input as [n_seqs, chunk_len, hidden]; flatten to [T, hidden]
+                    # to match v_hat from tgt_ids = y_chunk.reshape(-1) (same token order).
+                    z = z_cache[layer_idx].float().reshape(chunk_tokens, -1)
+                    # delta: [model_dim, hidden] matches proj.weight (stored fp32)
                     delta = scale * (v_hat.T @ z)
                     block.mlp.proj.weight.data.add_(delta)
 
