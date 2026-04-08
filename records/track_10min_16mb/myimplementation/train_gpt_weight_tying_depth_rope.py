@@ -293,23 +293,50 @@ if HAS_TRITON:
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr, NUM_SMS: tl.constexpr,
     ):
+        """TMA-based fused fc -> leaky_relu(0.5) -> square.
+        Uses Hopper TMA descriptors for async global->shared memory transfers.
+        Persistent kernel: one program per SM, loops over output tiles.
+        Interleaved writes for better memory throughput.
+        """
         dtype = tl.bfloat16
         start_pid = tl.program_id(axis=0)
-        num_pid_n = tl.cdiv(N, BLOCK_N); num_tiles = tl.cdiv(M, BLOCK_M) * num_pid_n
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        num_pid_n = tl.cdiv(N, BLOCK_N)
+        k_tiles = tl.cdiv(K, BLOCK_K)
+        num_tiles = num_pid_m * num_pid_n
+
         for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-            pid_m = tile_id // num_pid_n; pid_n = tile_id % num_pid_n
-            offs_am = pid_m * BLOCK_M; offs_bn = pid_n * BLOCK_N
+            pid_m = tile_id // num_pid_n
+            pid_n = tile_id % num_pid_n
+            offs_am = pid_m * BLOCK_M
+            offs_bn = pid_n * BLOCK_N
+
+            # Accumulate GEMM in fp32
             accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            for ki in range(tl.cdiv(K, BLOCK_K)):
-                a = a_desc.load([offs_am, ki * BLOCK_K]); b = b_desc.load([offs_bn, ki * BLOCK_K])
+            for ki in range(k_tiles):
+                offs_k = ki * BLOCK_K
+                a = a_desc.load([offs_am, offs_k])
+                b = b_desc.load([offs_bn, offs_k])
                 accumulator = tl.dot(a, b.T, accumulator)
-            acc = tl.permute(tl.reshape(accumulator, (BLOCK_M, 2, BLOCK_N // 2)), (0, 2, 1))
+
+            # Interleaved write: split into two halves for better memory throughput
+            acc = tl.reshape(accumulator, (BLOCK_M, 2, BLOCK_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
-            for acc_half, off_n in [(acc0, offs_bn), (acc1, offs_bn + BLOCK_N // 2)]:
-                c_half = acc_half.to(dtype)
-                c_ag = tl.where(c_half > 0, 2.0 * c_half, 0.5 * c_half)
-                c_desc.store([offs_am, off_n], c_ag)
-                aux_desc.store([offs_am, off_n], 0.5 * c_ag * c_half)
+
+            # First half: fused activation
+            c0 = acc0.to(dtype)
+            c0_ag = tl.where(c0 > 0, 2.0 * c0, 0.5 * c0)  # act_grad
+            c_desc.store([offs_am, offs_bn], c0_ag)
+            c0_post = 0.5 * c0_ag * c0  # leaky_relu(h)^2
+            aux_desc.store([offs_am, offs_bn], c0_post)
+
+            # Second half
+            c1 = acc1.to(dtype)
+            c1_ag = tl.where(c1 > 0, 2.0 * c1, 0.5 * c1)
+            c_desc.store([offs_am, offs_bn + BLOCK_N // 2], c1_ag)
+            c1_post = 0.5 * c1_ag * c1
+            aux_desc.store([offs_am, offs_bn + BLOCK_N // 2], c1_post)
 
     def _triton_fused_leaky_relu_sq(x_flat, fc_weight):
         M, K = x_flat.shape; N, _ = fc_weight.shape
