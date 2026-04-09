@@ -289,7 +289,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,attn_res_w,attn_res_ws",
     ).split(",")
     if pattern
 )
@@ -552,6 +552,26 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def full_attention_residual(w: Tensor, v_list: list[Tensor]) -> Tensor:
+    """Full Attention Residuals (AttnRes), arXiv:2603.15031 Eq. (2)-(4).
+
+    Depth-wise softmax over prior value vectors v_i with keys RMSNorm(v_i) and
+    logits q_l^T k_i for a learned pseudo-query w (per-layer). Matches MoonshotAI
+    reference: ``logits = einsum('d, n b t d -> n b t', w, K); h = softmax(logits) @ V``.
+
+    v_0 is the token embedding; v_i for i>=1 are the FULL outputs of block i (including
+    residual), NOT deltas. When only v_0 is present, h = v_0 (no mixing).
+    """
+    if len(v_list) == 1:
+        return v_list[0]
+    # v: [n, B, T, D]
+    v = torch.stack(v_list, dim=0)
+    k = F.rms_norm(v, (v.size(-1),))
+    logits = (k * w.to(dtype=k.dtype)[None, None, None, :]).sum(dim=-1)  # [n, B, T]
+    alpha = torch.softmax(logits, dim=0)  # softmax over depth dimension
+    return (alpha[..., None] * v).sum(dim=0)  # [B, T, D]
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -635,6 +655,8 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # Per-layer pseudo-query for depth attention; init 0 => uniform softmax at step 0.
+        self.attn_res_w = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -698,19 +720,26 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+        x0 = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
+        v_list: list[Tensor] = [x0]
+        x = x0
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
+        # Encoder: first half stores skips and builds v_list for AttnRes.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            h = full_attention_residual(self.blocks[i].attn_res_w, v_list) if len(v_list) > 1 else v_list[0]
+            x = self.blocks[i](h, x0)
+            v_list.append(x)
             skips.append(x)
+
+        # Decoder: second half applies AttnRes then adds scaled skip before each block.
         for i in range(self.num_decoder_layers):
+            blk_idx = self.num_encoder_layers + i
+            h = full_attention_residual(self.blocks[blk_idx].attn_res_w, v_list)
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+                h = h + self.skip_weights[i].to(dtype=h.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[blk_idx](h, x0)
+            v_list.append(x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)

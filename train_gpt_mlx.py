@@ -124,7 +124,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,attn_res_w,attn_res_ws,q_gain",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,attn_res_w,attn_res_ws,q_gain,resid_mix,resid_mixes,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -391,8 +391,12 @@ class Block(nn.Module):
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         # Per-layer pseudo-query for depth attention; init 0 => uniform softmax (paper §5).
         self.attn_res_w = mx.zeros((dim,), dtype=mx.float32)
+        # Per-dimension blend of current state with initial embedding x0; init=(ones, zeros) => identity.
+        self.resid_mix = mx.stack([mx.ones((dim,)), mx.zeros((dim,))]).astype(mx.float32)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+        mix = self.resid_mix.astype(x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -403,6 +407,8 @@ class GPT(nn.Module):
     # - token embedding + RMSNorm
     # - Full Attention Residuals over depth (arXiv:2603.15031): each block input is a
     #   softmax-weighted sum of the embedding and all prior block outputs f_i(h_i).
+    # - U-Net skip connections: encoder outputs are added (scaled) to decoder inputs.
+    # - resid_mix: per-dimension learnable blend of current state with initial embedding x0.
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
@@ -414,6 +420,11 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        num_skip = min(self.num_encoder_layers, self.num_decoder_layers)
+        # Skip weights: one [dim] vector per skip connection, init=ones (full encoder signal).
+        self.skip_weights = mx.ones((num_skip, dim), dtype=mx.float32)
         self.blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for i in range(num_layers)
@@ -432,13 +443,27 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        h1 = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
-        v_list: list[mx.array] = [h1]
-        x = h1
-        for block in self.blocks:
-            h = full_attention_residual(block.attn_res_w, v_list) if len(v_list) > 1 else v_list[0]
-            x = block(h)
+        x0 = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        v_list: list[mx.array] = [x0]
+        x = x0
+        skips: list[mx.array] = []
+
+        # Encoder: first half of blocks; store outputs for skip connections.
+        for i in range(self.num_encoder_layers):
+            h = full_attention_residual(self.blocks[i].attn_res_w, v_list) if len(v_list) > 1 else v_list[0]
+            x = self.blocks[i](h, x0)
             v_list.append(x)
+            skips.append(x)
+
+        # Decoder: second half; add scaled encoder skip to AttnRes input before each block.
+        for i in range(self.num_decoder_layers):
+            blk_idx = self.num_encoder_layers + i
+            h = full_attention_residual(self.blocks[blk_idx].attn_res_w, v_list)
+            if skips:
+                h = h + self.skip_weights[i].astype(h.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[blk_idx](h, x0)
+            v_list.append(x)
+
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -509,6 +534,11 @@ class SplitOptimizers:
             k
             for k, p in params.items()
             if k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+        ]
+        # Top-level control tensors (e.g. skip_weights) are not under "blocks." — add them to Adam.
+        self.scalar_keys += [
+            k for k, p in params.items()
+            if k != self.embed_key and not k.startswith("blocks.")
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
