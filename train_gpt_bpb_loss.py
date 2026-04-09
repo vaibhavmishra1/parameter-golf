@@ -1,7 +1,7 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Training minimizes (sum per-token NLL in nats) / (total UTF-8 bytes for targets) using the same byte LUT as `eval_val`; `model(...)` still returns mean token CE for validation. Logged `train_nats_per_byte` ≈ `val_bpb * ln(2)` when train/val distributions match.
+Training minimizes (sum per-token NLL in nats) / (total UTF-8 bytes for targets) using the same byte LUT as `eval_val`. Use `model(x, y, inv_b)` during training so `torch.compile` covers the same path as baseline; `model(x, y)` still returns mean token CE for validation. Logged `train_nats_per_byte` ≈ `val_bpb * ln(2)` when train/val distributions match.
 
 Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
 """
@@ -714,7 +714,8 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, inv_b: Tensor | None = None) -> Tensor:
+        """Token CE: mean nats/token if `inv_b` is None (eval); else (Σ nats) * inv_b for BPB-weighted train."""
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -738,32 +739,8 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
-
-    def forward_train_bpb(self, input_ids: Tensor, target_ids: Tensor, inv_b: Tensor) -> Tensor:
-        """(Σ token CE nats) * inv_b with inv_b = 1/B and B = UTF-8 bytes for targets (eval LUT)."""
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
-
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        if inv_b is None:
+            return F.cross_entropy(logits.float(), targets, reduction="mean")
         ce_sum = F.cross_entropy(logits.float(), targets, reduction="sum")
         return ce_sum * inv_b
 
@@ -1000,7 +977,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model.forward_train_bpb(x, y, inv_b)
+                    warmup_loss = model(x, y, inv_b)
                 warmup_loss.backward()
             for opt in optimizers:
                 opt.step()
@@ -1074,7 +1051,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model.forward_train_bpb(x, y, inv_b)
+                loss = model(x, y, inv_b)
             train_loss += loss.detach()
             loss.backward()
 
