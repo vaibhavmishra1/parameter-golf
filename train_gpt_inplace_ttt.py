@@ -5,16 +5,13 @@ Architecture, hyperparameters, training loop, quantization: ALL IDENTICAL to bas
 Only addition: eval_val_with_ttt() which applies In-Place Test-Time Training during validation.
 
 In-Place TTT (ICLR 2026 Oral, ByteDance):
-  - Updates W_down (MLP proj weights) as "fast weights" during evaluation
-  - Zero new stored parameters — W_down updates are ephemeral (reset per batch)
-  - Update rule: W_down^(i+1) = W_down^(i) + (η/T) * V̂[i].T @ Z[i]
-      Z[i]  = relu(fc(x))^2  (input to proj, captured via forward hook)
-      V̂[i]  = normalize(tok_emb[y[i]])  (NTP-aligned target, next-token embedding)
-  - Causality: forward prefix x[:, :chunk_end] (correct RoPE + left context), score slice
-    [chunk_start:chunk_end), update W_down, then next chunk.
-
-  Each TTT step must NOT forward only x[:, chunk_start:chunk_end]: that resets RoPE to 0..L-1
-  and removes all tokens left of chunk_start, so loss and Z are invalid (explains catastrophic TTT eval).
+  - Updates W_down (MLP proj weights) as "fast weights" during evaluation.
+  - Zero new stored parameters — W_down updates are ephemeral (reset per batch).
+  - Update: gradient descent on the NTP (CE) loss w.r.t. W_down only,
+    computed via torch.autograd.grad (true gradient, not the paper's V̂.T@Z
+    approximation which requires a jointly-trained W_target we don't have).
+  - Causality: forward prefix x[:, :chunk_end] (correct RoPE + left context),
+    score slice [chunk_start:chunk_end), compute gradient, update W_down, next chunk.
 
 Usage:
   TTT_ENABLED=1 TTT_LR=0.01 TTT_CHUNK_SIZE=64 torchrun ... train_gpt_inplace_ttt.py
@@ -292,7 +289,7 @@ def eval_val(
 
 
 # -------------------------------------------------------
-# IN-PLACE TTT EVAL
+# IN-PLACE TTT EVAL  (gradient-based, no W_target needed)
 # -------------------------------------------------------
 
 def eval_val_with_ttt(
@@ -310,32 +307,31 @@ def eval_val_with_ttt(
     ttt_chunk_size: int,
 ) -> tuple[float, float]:
     """
-    In-Place TTT evaluation following ByteDance ICLR 2026 Oral paper.
+    In-Place TTT evaluation using the TRUE NTP gradient w.r.t. W_down.
+
+    The paper's V̂.T @ Z update requires a jointly-trained W_target matrix to
+    produce correctly-scaled target vectors.  Without W_target the outer-product
+    has an arbitrary (and catastrophic) scale — tok_emb rows are not valid
+    proxies for ∂CE/∂(MLP output).
+
+    Instead we compute the exact gradient  ∂CE/∂W_down  via torch.autograd.grad,
+    keeping all other parameters frozen.  This is:
+      - correctly scaled by construction,
+      - faithful to the In-Place TTT concept (gradient descent on NTP loss,
+        restricted to W_down),
+      - no new parameters needed.
 
     Algorithm per batch of sequences:
-      1. Save W_down (proj) weights for all MLP layers.
+      1. Reset W_down (proj weights) to trained values.
       2. For each chunk [chunk_start, chunk_end):
-         a. SCORE: forward on prefix x[:, :chunk_end] (full left context + correct RoPE indices).
-            Accumulate token CE only for positions [chunk_start, chunk_end).
-            Capture Z on the same forward via hooks; slice Z[:, chunk_start:chunk_end].
-         b. UPDATE: W_down += (ttt_lr / T) * V̂.T @ Z  (T = tokens in slice; same rows as loss).
-      3. Restore W_down to trained values (ephemeral fast weights, not saved).
-      4. All-reduce across ranks, compute BPB exactly as standard eval.
+         a. Forward on prefix x[:, :chunk_end] WITH autograd graph for proj weights.
+            Compute CE *sum* on positions [chunk_start, chunk_end) only.
+            This is the causal score (recorded BEFORE the update).
+         b. torch.autograd.grad(CE_mean, proj_weights) → true gradient.
+         c. W_down -= ttt_lr × grad.
+      3. Restore W_down; all-reduce; compute BPB.
 
-    Forwarding only x[:, chunk_start:chunk_end] would reset RoPE and attention to a short
-    standalone segment — that is not the same model as full-sequence eval and breaks TTT.
-
-    Batch coupling: one set of fast weights is updated from all sequences in the val minibatch
-    together each chunk (not independent per-sequence TTT as in single-stream inference).
-
-    Metrics: with ttt_lr=0, val_loss here matches standard mean token CE (sum of slice CEs
-    equals one full forward). With ttt_lr>0, reported loss is sequential-TTT scoring, not a
-    single static forward over the whole sequence.
-
-    Note: base_model is used directly (not the compiled/DDP wrapper) so that:
-      (a) Forward hooks work reliably.
-      (b) Weight updates take immediate effect for the next chunk.
-    This is slower than the compiled path (~2x) but eval time is not competition-scored.
+    Cost: ~12× standard eval (growing-prefix forward + backward per chunk).
     """
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
@@ -351,21 +347,22 @@ def eval_val_with_ttt(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count  = torch.zeros((), device=device, dtype=torch.float64)
 
-    # --- Save trained W_down weights (float32 copies) ---
-    # proj.weight dtype is float32 because CastedLinear layers were set to .float()
+    # --- Save trained W_down weights ---
     base_proj_weights: list[Tensor] = [
-        block.mlp.proj.weight.detach().clone().float()
+        block.mlp.proj.weight.detach().clone()
         for block in base_model.blocks
     ]
 
-    # Direction in model_dim for each target token: must match the readout used for logits.
-    # Tied LM: logits use tok_emb rows; untied: logits use lm_head rows (not tok_emb).
-    if base_model.tie_embeddings:
-        target_dir_weight: Tensor = base_model.tok_emb.weight.detach()
-    else:
-        if base_model.lm_head is None:
-            raise RuntimeError("TTT eval requires lm_head when tie_embeddings=False")
-        target_dir_weight = base_model.lm_head.weight.detach()
+    # --- Freeze everything except proj weights ---
+    saved_requires_grad: dict[int, bool] = {}
+    for p in base_model.parameters():
+        saved_requires_grad[id(p)] = p.requires_grad
+        p.requires_grad_(False)
+
+    proj_weights: list[Tensor] = []
+    for block in base_model.blocks:
+        block.mlp.proj.weight.requires_grad_(True)
+        proj_weights.append(block.mlp.proj.weight)
 
     base_model.eval()
 
@@ -376,90 +373,56 @@ def eval_val_with_ttt(
         raw_start = batch_seq_start * args.train_seq_len
         raw_end   = batch_seq_end * args.train_seq_len + 1
         local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-        # x_batch: [n_seqs, seq_len],  y_batch: [n_seqs, seq_len]
         x_batch = local[:-1].reshape(n_seqs, args.train_seq_len)
         y_batch = local[1: ].reshape(n_seqs, args.train_seq_len)
 
         # Reset W_down to trained values at the start of each batch.
-        # (Treat each batch as a separate "document" for TTT purposes.)
         with torch.no_grad():
-            for block, base_w in zip(base_model.blocks, base_proj_weights):
-                block.mlp.proj.weight.data.copy_(base_w)
+            for pw, base_w in zip(proj_weights, base_proj_weights):
+                pw.data.copy_(base_w)
 
         # --- TTT chunk loop ---
         for chunk_start in range(0, args.train_seq_len, ttt_chunk_size):
             chunk_end = min(chunk_start + ttt_chunk_size, args.train_seq_len)
-            # Prefix [0:chunk_end) so RoPE positions and causal attention match full-sequence eval.
-            x_prefix = x_batch[:, :chunk_end]
-            y_prefix = y_batch[:, :chunk_end]
-            y_slice = y_batch[:, chunk_start:chunk_end]
             chunk_tokens = n_seqs * (chunk_end - chunk_start)
 
-            # ---- STEP 2a: SCORE (causal: before update) -------------------------
-            # Register forward hooks to capture Z = relu(fc(x))^2 (input to proj)
-            # on the prefix forward; slice [chunk_start:chunk_end] for the TTT update.
-            z_cache: dict[int, Tensor] = {}
+            # Full prefix preserves RoPE positions and causal attention context.
+            x_prefix = x_batch[:, :chunk_end]
+            y_prefix = y_batch[:, :chunk_end]
 
-            def _make_hook(layer_idx: int):
-                def _hook(module: nn.Module, inp: tuple, out: Tensor) -> None:
-                    # inp[0] is the tensor passed to CastedLinear.forward(x),
-                    # which in MLP.forward is `relu(fc(x)).square()` = Z.
-                    z_cache[layer_idx] = inp[0].detach()
-                return _hook
+            # ---- Forward WITH autograd (builds graph for proj weights) ----
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                ce_sum = base_model.token_cross_entropy_sum_slice(
+                    x_prefix, y_prefix, chunk_start, chunk_end
+                )
 
-            hooks = [
-                block.mlp.proj.register_forward_hook(_make_hook(i))
-                for i, block in enumerate(base_model.blocks)
-            ]
-
-            with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    ce_sum = base_model.token_cross_entropy_sum_slice(
-                        x_prefix, y_prefix, chunk_start, chunk_end
-                    ).detach()
-
-            for h in hooks:
-                h.remove()
-
-            # Accumulate loss and byte-count metrics (identical formula to eval_val)
-            val_loss_sum += ce_sum.to(torch.float64)
+            # ---- Record causal score (before update) ----
+            val_loss_sum += ce_sum.detach().to(torch.float64)
             val_token_count += chunk_tokens
+
             prev_ids = x_batch[:, chunk_start:chunk_end].reshape(-1)
-            tgt_ids = y_slice.reshape(-1)
+            tgt_ids  = y_batch[:, chunk_start:chunk_end].reshape(-1)
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (
                 has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
             ).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
 
-            # ---- STEP 2b: UPDATE W_down -----------------------------------------
-            # V̂ = normalize(tok_emb[next_tokens])  [NTP-aligned target]
-            # ΔW_down = (ttt_lr / T) * V̂.T @ Z
-            #   V̂ shape: [T, model_dim=512]
-            #   Z shape:  [n_seqs, chunk_len, hidden] -> reshape to [T, hidden]
-            #   ΔW_down:  [model_dim, hidden] = proj.weight shape  ✓
-            #
-            # Lazy outer-product step: (η/T) * Σ_t v̂_t^T z_t  with W shape [dim, hidden],
-            # matching logits z_t @ W.T vs readout directions v̂_t (approximate LM alignment).
+            # ---- True gradient of mean CE w.r.t. proj weights ----
+            ce_mean = ce_sum / chunk_tokens
+            grads = torch.autograd.grad(ce_mean, proj_weights)
+
+            # ---- Update W_down (SGD step) ----
             with torch.no_grad():
-                v_hat = target_dir_weight[tgt_ids].float()       # [T, model_dim]
-                v_hat = F.rms_norm(v_hat, (v_hat.size(-1),))       # unit-norm rows
+                for pw, g in zip(proj_weights, grads):
+                    pw.data -= ttt_lr * g.float()
 
-                scale = ttt_lr / chunk_tokens                       # per-token step size
-
-                for layer_idx, block in enumerate(base_model.blocks):
-                    if layer_idx not in z_cache:
-                        continue
-                    # Hook sees [n_seqs, chunk_end, hidden] on prefix forward; take TTT slice only.
-                    z = z_cache[layer_idx][:, chunk_start:chunk_end, :].float().reshape(chunk_tokens, -1)
-                    # delta: [model_dim, hidden] matches proj.weight (stored fp32)
-                    delta = scale * (v_hat.T @ z)
-                    block.mlp.proj.weight.data.add_(delta)
-
-    # --- Restore trained W_down (fast weights are ephemeral) ---
+    # --- Restore trained W_down and requires_grad state ---
     with torch.no_grad():
-        for block, base_w in zip(base_model.blocks, base_proj_weights):
-            block.mlp.proj.weight.data.copy_(base_w)
+        for pw, base_w in zip(proj_weights, base_proj_weights):
+            pw.data.copy_(base_w)
+    for p in base_model.parameters():
+        p.requires_grad_(saved_requires_grad.get(id(p), True))
 
     # All-reduce across distributed ranks
     if dist.is_available() and dist.is_initialized():
