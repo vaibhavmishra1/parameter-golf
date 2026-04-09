@@ -78,8 +78,10 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    # Lion (matrix blocks): https://github.com/lucidrains/lion-pytorch — LR often ~3× smaller than Adam-class.
-    lion_lr_scale = float(os.environ.get("LION_LR_SCALE", str(1.0 / 3.0)))
+    # Lion (matrix blocks): https://github.com/lucidrains/lion-pytorch
+    # Default scale 1.0 matches the old Muon slot (same MATRIX_LR). The paper's "~3× smaller
+    # than AdamW" rule applies when replacing Adam on those weights — not when swapping Muon→Lion.
+    lion_lr_scale = float(os.environ.get("LION_LR_SCALE", "1.0"))
     lion_beta1 = float(os.environ.get("LION_BETA1", 0.95))
     lion_beta2 = float(os.environ.get("LION_BETA2", 0.98))
     lion_weight_decay = float(os.environ.get("LION_WEIGHT_DECAY", 0.0))
