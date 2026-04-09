@@ -10,7 +10,11 @@ In-Place TTT (ICLR 2026 Oral, ByteDance):
   - Update rule: W_down^(i+1) = W_down^(i) + (η/T) * V̂[i].T @ Z[i]
       Z[i]  = relu(fc(x))^2  (input to proj, captured via forward hook)
       V̂[i]  = normalize(tok_emb[y[i]])  (NTP-aligned target, next-token embedding)
-  - Causality: score chunk i → update → score chunk i+1  (never reversed)
+  - Causality: forward prefix x[:, :chunk_end] (correct RoPE + left context), score slice
+    [chunk_start:chunk_end), update W_down, then next chunk.
+
+  Each TTT step must NOT forward only x[:, chunk_start:chunk_end]: that resets RoPE to 0..L-1
+  and removes all tokens left of chunk_start, so loss and Z are invalid (explains catastrophic TTT eval).
 
 Usage:
   TTT_ENABLED=1 TTT_LR=0.01 TTT_CHUNK_SIZE=64 torchrun ... train_gpt_inplace_ttt.py
@@ -310,19 +314,23 @@ def eval_val_with_ttt(
 
     Algorithm per batch of sequences:
       1. Save W_down (proj) weights for all MLP layers.
-      2. For each chunk position c in [0, seq_len, step=ttt_chunk_size]:
-         a. SCORE: forward pass on chunk → accumulate loss/BPB.
-            Simultaneously capture Z[c] (input to proj) via forward hook.
-         b. UPDATE: W_down += (ttt_lr / T) * V̂[c].T @ Z[c]
-            where V̂[c] = normalize(tok_emb[next_tokens[c]])  (NTP target)
-            T = number of tokens in chunk
+      2. For each chunk [chunk_start, chunk_end):
+         a. SCORE: forward on prefix x[:, :chunk_end] (full left context + correct RoPE indices).
+            Accumulate token CE only for positions [chunk_start, chunk_end).
+            Capture Z on the same forward via hooks; slice Z[:, chunk_start:chunk_end].
+         b. UPDATE: W_down += (ttt_lr / T) * V̂.T @ Z  (T = tokens in slice; same rows as loss).
       3. Restore W_down to trained values (ephemeral fast weights, not saved).
       4. All-reduce across ranks, compute BPB exactly as standard eval.
 
-    Causality guarantee: Step 2a runs before 2b for each chunk c.
-    The model sees future tokens in V̂[c] (the next-token targets used for the UPDATE),
-    but those tokens are also the labels that define the LOSS already computed in 2a —
-    consistent with standard NTP evaluation. No future logits leak into scoring.
+    Forwarding only x[:, chunk_start:chunk_end] would reset RoPE and attention to a short
+    standalone segment — that is not the same model as full-sequence eval and breaks TTT.
+
+    Batch coupling: one set of fast weights is updated from all sequences in the val minibatch
+    together each chunk (not independent per-sequence TTT as in single-stream inference).
+
+    Metrics: with ttt_lr=0, val_loss here matches standard mean token CE (sum of slice CEs
+    equals one full forward). With ttt_lr>0, reported loss is sequential-TTT scoring, not a
+    single static forward over the whole sequence.
 
     Note: base_model is used directly (not the compiled/DDP wrapper) so that:
       (a) Forward hooks work reliably.
@@ -350,10 +358,14 @@ def eval_val_with_ttt(
         for block in base_model.blocks
     ]
 
-    # Token embedding weight for computing V̂ (NTP-aligned targets).
-    # tok_emb.weight is bfloat16 (set by base_model.bfloat16() in main).
-    # We cast to float32 for stable update arithmetic.
-    tok_emb_weight: Tensor = base_model.tok_emb.weight.detach()  # [vocab_size, model_dim]
+    # Direction in model_dim for each target token: must match the readout used for logits.
+    # Tied LM: logits use tok_emb rows; untied: logits use lm_head rows (not tok_emb).
+    if base_model.tie_embeddings:
+        target_dir_weight: Tensor = base_model.tok_emb.weight.detach()
+    else:
+        if base_model.lm_head is None:
+            raise RuntimeError("TTT eval requires lm_head when tie_embeddings=False")
+        target_dir_weight = base_model.lm_head.weight.detach()
 
     base_model.eval()
 
@@ -377,13 +389,15 @@ def eval_val_with_ttt(
         # --- TTT chunk loop ---
         for chunk_start in range(0, args.train_seq_len, ttt_chunk_size):
             chunk_end = min(chunk_start + ttt_chunk_size, args.train_seq_len)
-            x_chunk = x_batch[:, chunk_start:chunk_end]  # [n_seqs, chunk_len]
-            y_chunk = y_batch[:, chunk_start:chunk_end]  # [n_seqs, chunk_len]
+            # Prefix [0:chunk_end) so RoPE positions and causal attention match full-sequence eval.
+            x_prefix = x_batch[:, :chunk_end]
+            y_prefix = y_batch[:, :chunk_end]
+            y_slice = y_batch[:, chunk_start:chunk_end]
             chunk_tokens = n_seqs * (chunk_end - chunk_start)
 
             # ---- STEP 2a: SCORE (causal: before update) -------------------------
             # Register forward hooks to capture Z = relu(fc(x))^2 (input to proj)
-            # in the same forward pass that computes the loss.
+            # on the prefix forward; slice [chunk_start:chunk_end] for the TTT update.
             z_cache: dict[int, Tensor] = {}
 
             def _make_hook(layer_idx: int):
@@ -400,16 +414,18 @@ def eval_val_with_ttt(
 
             with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    chunk_loss = base_model(x_chunk, y_chunk).detach()
+                    ce_sum = base_model.token_cross_entropy_sum_slice(
+                        x_prefix, y_prefix, chunk_start, chunk_end
+                    ).detach()
 
             for h in hooks:
                 h.remove()
 
             # Accumulate loss and byte-count metrics (identical formula to eval_val)
-            val_loss_sum   += chunk_loss.to(torch.float64) * chunk_tokens
+            val_loss_sum += ce_sum.to(torch.float64)
             val_token_count += chunk_tokens
-            prev_ids = x_chunk.reshape(-1)
-            tgt_ids  = y_chunk.reshape(-1)
+            prev_ids = x_batch[:, chunk_start:chunk_end].reshape(-1)
+            tgt_ids = y_slice.reshape(-1)
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (
                 has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
@@ -423,11 +439,10 @@ def eval_val_with_ttt(
             #   Z shape:  [n_seqs, chunk_len, hidden] -> reshape to [T, hidden]
             #   ΔW_down:  [model_dim, hidden] = proj.weight shape  ✓
             #
-            # This is the "lazy" gradient step (drops the quadratic W_down term),
-            # equivalent to one step of gradient descent on  L = ||Z @ W_down.T - V̂||^2
-            # with the current W_down treated as constant in the gradient.
+            # Lazy outer-product step: (η/T) * Σ_t v̂_t^T z_t  with W shape [dim, hidden],
+            # matching logits z_t @ W.T vs readout directions v̂_t (approximate LM alignment).
             with torch.no_grad():
-                v_hat = tok_emb_weight[tgt_ids].float()            # [T, 512]
+                v_hat = target_dir_weight[tgt_ids].float()       # [T, model_dim]
                 v_hat = F.rms_norm(v_hat, (v_hat.size(-1),))       # unit-norm rows
 
                 scale = ttt_lr / chunk_tokens                       # per-token step size
@@ -435,9 +450,8 @@ def eval_val_with_ttt(
                 for layer_idx, block in enumerate(base_model.blocks):
                     if layer_idx not in z_cache:
                         continue
-                    # Hook sees proj input as [n_seqs, chunk_len, hidden]; flatten to [T, hidden]
-                    # to match v_hat from tgt_ids = y_chunk.reshape(-1) (same token order).
-                    z = z_cache[layer_idx].float().reshape(chunk_tokens, -1)
+                    # Hook sees [n_seqs, chunk_end, hidden] on prefix forward; take TTT slice only.
+                    z = z_cache[layer_idx][:, chunk_start:chunk_end, :].float().reshape(chunk_tokens, -1)
                     # delta: [model_dim, hidden] matches proj.weight (stored fp32)
                     delta = scale * (v_hat.T @ z)
                     block.mlp.proj.weight.data.add_(delta)
@@ -864,6 +878,35 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+    def token_cross_entropy_sum_slice(
+        self, input_ids: Tensor, target_ids: Tensor, slice_lo: int, slice_hi: int
+    ) -> Tensor:
+        """Forward on [B, L] prefix; return sum of token CE over target positions [slice_lo, slice_hi)."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+
+        x = self.final_norm(x)
+        log_slice = x[:, slice_lo:slice_hi, :].reshape(-1, x.size(-1))
+        tgt_slice = target_ids[:, slice_lo:slice_hi].reshape(-1)
+        if self.tie_embeddings:
+            logits_proj = F.linear(log_slice, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(log_slice)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), tgt_slice, reduction="sum")
 
 
 # -----------------------------
