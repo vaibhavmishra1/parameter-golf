@@ -124,7 +124,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,attn_res_w,attn_res_ws,q_gain",
     ).split(",")
     if pattern
 )
@@ -171,6 +171,27 @@ def accumulate_flat_grads(
 
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
+
+
+def full_attention_residual(w: mx.array, v_list: list[mx.array]) -> mx.array:
+    """Full Attention Residuals (AttnRes), arXiv:2603.15031 Eq. (2)-(4).
+
+    Depth-wise softmax over prior value vectors v_i with keys RMSNorm(v_i) and
+    logits q_l^T k_i for a learned pseudo-query w (per-layer). Matches MoonshotAI
+    reference: ``logits = einsum('d, n b t d -> n b t', w, K); h = softmax(logits) @ V``.
+
+    v_0 is the token embedding; v_i for i>=1 are the FULL outputs of block i (including
+    residual), NOT deltas.  When only v_0 is present, h = v_0 (no mixing).
+    """
+    if len(v_list) == 1:
+        return v_list[0]
+    # V: [n, B, T, D]
+    v = mx.stack(v_list, axis=0)
+    k = rms_norm(v)
+    wdt = w.astype(k.dtype)
+    logits = (k * wdt.reshape((1, 1, 1, -1))).sum(axis=-1)
+    alpha = mx.softmax(logits, axis=0)
+    return (alpha[..., None] * v).sum(axis=0)
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
@@ -368,11 +389,10 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        # Per-layer pseudo-query for depth attention; init 0 => uniform softmax (paper §5).
+        self.attn_res_w = mx.zeros((dim,), dtype=mx.float32)
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
-        mix = self.resid_mix.astype(x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def __call__(self, x: mx.array) -> mx.array:
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -381,8 +401,8 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
     # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
+    # - Full Attention Residuals over depth (arXiv:2603.15031): each block input is a
+    #   softmax-weighted sum of the embedding and all prior block outputs f_i(h_i).
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
@@ -394,10 +414,6 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for i in range(num_layers)
@@ -416,20 +432,13 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
-        x0 = x
-        skips: list[mx.array] = []
-
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        h1 = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        v_list: list[mx.array] = [h1]
+        x = h1
+        for block in self.blocks:
+            h = full_attention_residual(block.attn_res_w, v_list) if len(v_list) > 1 else v_list[0]
+            x = block(h)
+            v_list.append(x)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -499,7 +508,7 @@ class SplitOptimizers:
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -954,7 +963,7 @@ def main() -> None:
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
-        f"skip_weights:{model.skip_weights.dtype}"
+        f"attn_res_w:{model.blocks[0].attn_res_w.dtype}"
     )
 
     # ==============================================================================
