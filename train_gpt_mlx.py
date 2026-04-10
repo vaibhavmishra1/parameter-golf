@@ -80,6 +80,10 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    # Mixture-of-Depths: learned per-token sigmoid gate on MLP output.
+    # gate = sigmoid(RMSNorm(x) @ router_w); init router_w=0 => gate=0.5 everywhere at step 0.
+    # Set MOD_ENABLED=0 to disable and match exact baseline behaviour.
+    mod_enabled: bool = bool(int(os.environ.get("MOD_ENABLED", "1")))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -360,6 +364,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mod_enabled: bool = True,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
@@ -369,13 +374,26 @@ class Block(nn.Module):
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        # MoD router: projects token repr → scalar gate on MLP output.
+        # init=0 => sigmoid(0)=0.5 for all tokens at step 0; router learns via CE gradients.
+        # Attention always runs on full sequence (preserves RoPE + causal mask).
+        self.mod_enabled = mod_enabled
+        self.router_w = mx.zeros((dim,), dtype=mx.float32)
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # Attention always runs on the full sequence.
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        # MoD: per-token sigmoid gate on MLP. The post-attention repr is the routing signal —
+        # "does this token, after seeing its context, still need MLP refinement?"
+        mlp_out = self.mlp(self.mlp_norm(x))
+        if self.mod_enabled:
+            gate = mx.sigmoid(rms_norm(x) @ self.router_w.astype(x.dtype))  # [B, T]
+            x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * gate[..., None] * mlp_out
+        else:
+            x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
         return x
 
 
@@ -386,7 +404,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, mod_enabled: bool = True):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -399,7 +417,7 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mod_enabled=mod_enabled)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -897,7 +915,9 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        mod_enabled=args.mod_enabled,
     )
+    log(f"mod_enabled:{args.mod_enabled}")
     opt = SplitOptimizers(model, args)
 
     # ==============================================================================
