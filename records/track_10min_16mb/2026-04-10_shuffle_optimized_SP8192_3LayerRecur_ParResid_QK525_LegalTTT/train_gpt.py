@@ -61,13 +61,19 @@ class ShuffledSequenceLoader:
 		if not all_files:raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
 		self.files=all_files[h.rank::h.world_size];self.rng=np.random.Generator(np.random.PCG64(h.rank));self.num_tokens=[_read_num_tokens(f)for f in self.files];self.start_inds=[[]for _ in self.files]
 		for si in range(len(self.files)):self._reset_shard(si)
-	def _reset_shard(self,si):max_phase=min(self.seq_len-1,max(0,self.num_tokens[si]-self.seq_len-1));phase=int(self.rng.integers(max_phase+1))if max_phase>0 else 0;num_sequences=(self.num_tokens[si]-1-phase)//self.seq_len;sequence_order=self.rng.permutation(num_sequences);self.start_inds[si]=(phase+sequence_order*self.seq_len).tolist()
-	def next_batch(self,global_tokens,grad_accum_steps):
-		device_tokens=global_tokens//(self.world_size*grad_accum_steps);device_batch_size=device_tokens//self.seq_len;remaining=np.array([len(s)for s in self.start_inds],dtype=np.float64);x=torch.empty((device_batch_size,self.seq_len),dtype=torch.int64);y=torch.empty((device_batch_size,self.seq_len),dtype=torch.int64)
-		x_np = np.empty((device_batch_size, self.seq_len), dtype=np.int64)
-		y_np = np.empty((device_batch_size, self.seq_len), dtype=np.int64)
+		self.global_tokens=int(os.environ.get('TRAIN_BATCH_TOKENS',786432))
+		world_size=int(os.environ.get('WORLD_SIZE','1'))
+		self.grad_accum_steps=8//world_size
+		self.device_tokens=self.global_tokens//(self.world_size*self.grad_accum_steps);
+		self.device_batch_size=self.device_tokens//self.seq_len
 
-		for bi in range(device_batch_size):
+	def _reset_shard(self,si):max_phase=min(self.seq_len-1,max(0,self.num_tokens[si]-self.seq_len-1));phase=int(self.rng.integers(max_phase+1))if max_phase>0 else 0;num_sequences=(self.num_tokens[si]-1-phase)//self.seq_len;sequence_order=self.rng.permutation(num_sequences);self.start_inds[si]=(phase+sequence_order*self.seq_len).tolist()
+	def next_batch(self):
+		remaining=np.array([len(s)for s in self.start_inds],dtype=np.float64)
+		x_np = np.empty((self.device_batch_size, self.seq_len), dtype=np.int64)
+		y_np = np.empty((self.device_batch_size, self.seq_len), dtype=np.int64)
+
+		for bi in range(self.device_batch_size):
 			total=remaining.sum()
 			if total<=0:
 				for si in range(len(self.files)):self._reset_shard(si)
@@ -250,7 +256,7 @@ def collect_hessians(model,train_loader,h,device,n_calibration_batches=64):
 		hooks.append(hook_module.register_forward_hook(make_output_hook('tok_emb.weight')))
 	model.eval()
 	with torch.no_grad():
-		for _ in range(n_calibration_batches):x,_=train_loader.next_batch(h.train_batch_tokens,h.grad_accum_steps);model.forward_logits(x)
+		for _ in range(n_calibration_batches):x,_=train_loader.next_batch();model.forward_logits(x)
 	for hook in hooks:hook.remove()
 	for name in hessians:hessians[name]=hessians[name].cpu()/n_calibration_batches
 	return hessians
@@ -400,7 +406,7 @@ def train_model(h,device,val_data):
 		optimizers.zero_grad_all();train_loss=torch.zeros((),device=device)
 		for micro_step in range(h.grad_accum_steps):
 			if h.distributed:model.require_backward_grad_sync=micro_step==h.grad_accum_steps-1
-			x,y=train_loader.next_batch(h.train_batch_tokens,h.grad_accum_steps)
+			x,y=train_loader.next_batch()
 			with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):loss=model(x,y)
 			train_loss+=loss.detach();(loss/h.grad_accum_steps).backward()
 		train_loss/=h.grad_accum_steps;frac=min(step/h.muon_momentum_warmup_steps,1.)if h.muon_momentum_warmup_steps>0 else 1.;muon_momentum=(1-frac)*h.muon_momentum_warmup_start+frac*h.muon_momentum
