@@ -58,8 +58,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    stochastic_depth_prob = float(os.environ.get("STOCHASTIC_DEPTH_PROB", 0.0))
-    position_loss_min_weight = float(os.environ.get("POSITION_LOSS_MIN_WEIGHT", 0.1))
+
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -291,7 +290,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,conv_weight,conv_scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,conv_kernel",
     ).split(",")
     if pattern
 )
@@ -637,24 +636,28 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        # Depthwise causal conv (weight zero-init = no initial contribution; scale ones-init like attn/mlp_scale)
-        self.conv_weight = nn.Parameter(torch.zeros(dim, 3, dtype=torch.float32))
-        self.conv_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        # Low-rank separable causal conv (parallel with attention, kernel_size=7, rank=dim//16)
+        # conv_down/conv_up are 2D → trained by Muon; conv_kernel is 2D but routed to Adam via CONTROL_TENSOR_NAME_PATTERNS
+        # conv_up zero-init → no initial output, but gradient flows immediately once conv_kernel becomes non-zero
+        conv_rank = max(dim // 16, 16)
+        self.conv_down = CastedLinear(dim, conv_rank, bias=False)
+        self.conv_kernel = nn.Parameter(torch.randn(conv_rank, 7, dtype=torch.float32) * 0.01)
+        self.conv_up = CastedLinear(conv_rank, dim, bias=False)
+        self.conv_up._zero_init = True
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        conv_in = F.rms_norm(x, (x.size(-1),))
-        x_pad = F.pad(conv_in, (0, 0, 2, 0))
-        w = self.conv_weight.to(dtype=x.dtype)
-        conv_out = (
-            x_pad[:, :-2, :] * w[:, 0][None, None, :]
-            + x_pad[:, 1:-1, :] * w[:, 1][None, None, :]
-            + x_pad[:, 2:, :] * w[:, 2][None, None, :]
-        )
-        x = x + self.conv_scale.to(dtype=x.dtype)[None, None, :] * conv_out
+        x_normed = self.attn_norm(x)
+        attn_out = self.attn(x_normed)
+        # Low-rank causal conv runs in parallel with attention on the same normed input
+        h = self.conv_down(x_normed)                                          # [B, T, r]
+        h_t = h.transpose(1, 2)                                               # [B, r, T]
+        h_pad = F.pad(h_t, (6, 0))                                            # causal pad [B, r, T+6]
+        w = self.conv_kernel.to(dtype=h.dtype).unsqueeze(1)                   # [r, 1, 7]
+        conv_h = F.conv1d(h_pad, w, groups=self.conv_kernel.size(0)).transpose(1, 2)  # [B, T, r]
+        conv_out = self.conv_up(conv_h)                                       # [B, T, dim]
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out + conv_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -673,8 +676,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        drop_prob: float = 0.0,
-        pos_loss_min_weight: float = 0.1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -682,8 +683,6 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.drop_prob = float(drop_prob)
-        self.pos_loss_min_weight = float(pos_loss_min_weight)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -715,33 +714,21 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _forward_backbone(self, input_ids: Tensor, use_stochastic_depth: bool) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
-            x_prev = x
             x = self.blocks[i](x, x0)
-            if use_stochastic_depth and self.drop_prob > 0.0:
-                keep = torch.rand((), device=x.device, dtype=torch.float32) >= self.drop_prob
-                x = torch.where(keep, x, x_prev)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x_prev = x
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-            if use_stochastic_depth and self.drop_prob > 0.0:
-                keep = torch.rand((), device=x.device, dtype=torch.float32) >= self.drop_prob
-                x = torch.where(keep, x, x_prev)
-        return self.final_norm(x)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        use_sd = self.training and self.drop_prob > 0.0
-        x = self._forward_backbone(input_ids, use_stochastic_depth=use_sd)
-        x = x.reshape(-1, x.size(-1))
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -750,17 +737,7 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        logits_f = logits.float()
-        if self.training:
-            per_token = F.cross_entropy(logits_f, targets, reduction="none")
-            bsz, seqlen = target_ids.shape
-            w_min = self.pos_loss_min_weight
-            positions = torch.arange(seqlen, device=target_ids.device, dtype=torch.float32)
-            denom_t = max(seqlen - 1, 1)
-            weights = w_min + (1.0 - w_min) * positions / denom_t
-            per_token = per_token.reshape(bsz, seqlen)
-            return (per_token * weights[None, :]).sum() / (bsz * weights.sum())
-        return F.cross_entropy(logits_f, targets, reduction="mean")
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -874,8 +851,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        drop_prob=args.stochastic_depth_prob,
-        pos_loss_min_weight=args.position_loss_min_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -949,9 +924,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        f"stochastic_depth:{args.stochastic_depth_prob} position_loss_min_weight:{args.position_loss_min_weight}"
-    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
