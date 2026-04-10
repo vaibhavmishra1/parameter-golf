@@ -80,6 +80,10 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    # Stochastic depth is incompatible with mx.compile (random state breaks caching).
+    # Set >0 only for CUDA/PyTorch. For MLX, keep at 0.
+    stochastic_depth_prob: float = float(os.environ.get("STOCHASTIC_DEPTH_PROB", 0.0))
+    position_loss_min_weight: float = float(os.environ.get("POSITION_LOSS_MIN_WEIGHT", 0.1))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -124,7 +128,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,conv_weight,conv_scale",
     ).split(",")
     if pattern
 )
@@ -369,12 +373,26 @@ class Block(nn.Module):
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        # Depthwise causal conv for local n-gram patterns (weight zero-init = no initial contribution,
+        # scale ones-init = gradient flows to weight from step 1, matching attn_scale/mlp_scale pattern)
+        self.conv_weight = mx.zeros((dim, 3), dtype=mx.float32)
+        self.conv_scale = mx.ones((dim,), dtype=mx.float32)
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        # Causal depthwise conv branch (captures local bigram/trigram patterns)
+        conv_in = rms_norm(x)
+        x_pad = mx.pad(conv_in, [(0, 0), (2, 0), (0, 0)])
+        w = self.conv_weight.astype(x.dtype)
+        conv_out = (
+            x_pad[:, :-2, :] * w[:, 0][None, None, :] +
+            x_pad[:, 1:-1, :] * w[:, 1][None, None, :] +
+            x_pad[:, 2:, :] * w[:, 2][None, None, :]
+        )
+        x = x + self.conv_scale.astype(x.dtype)[None, None, :] * conv_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -386,12 +404,14 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, drop_prob: float = 0.0, pos_loss_min_weight: float = 0.1):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.drop_prob = drop_prob
+        self.pos_loss_min_weight = pos_loss_min_weight
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -450,6 +470,48 @@ class GPT(nn.Module):
             logits = self.softcap(logits_proj)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
         return loss_sum / float(n)
+
+    def forward_train(self, input_ids: mx.array) -> mx.array:
+        """Forward pass for training. Uses stochastic depth if drop_prob > 0,
+        otherwise identical to __call__ (avoids mx.random inside mx.compile)."""
+        if self.drop_prob <= 0:
+            return self(input_ids)
+        # Stochastic depth path (requires mx.random.state in compile inputs)
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x
+        skips: list[mx.array] = []
+        for i in range(self.num_encoder_layers):
+            x_prev = x
+            x = self.blocks[i](x, x0)
+            keep = (mx.random.uniform() >= self.drop_prob)
+            x = mx.where(keep, x, x_prev)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            x_prev = x
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            keep = (mx.random.uniform() >= self.drop_prob)
+            x = mx.where(keep, x, x_prev)
+        return self.final_norm(x)
+
+    def loss_train(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+        """Training loss with stochastic depth + position-weighted CE."""
+        x = self.forward_train(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
+        logits = self.softcap(logits_proj)
+
+        per_token_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="none")
+
+        # Position weights: ramp from pos_loss_min_weight at position 0 to 1.0 at position T-1
+        B, T = target_ids.shape
+        w_min = self.pos_loss_min_weight
+        positions = mx.arange(T).astype(mx.float32)
+        weights = w_min + (1.0 - w_min) * positions / max(T - 1, 1)  # [T]
+        per_token_loss = per_token_loss.reshape(B, T)
+        weighted_loss = (per_token_loss * weights[None, :]).sum() / (B * weights.sum())
+        return weighted_loss
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -897,6 +959,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        drop_prob=args.stochastic_depth_prob,
+        pos_loss_min_weight=args.position_loss_min_weight,
     )
     opt = SplitOptimizers(model, args)
 
@@ -909,7 +973,7 @@ def main() -> None:
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
     compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
     compiled_loss_and_grad = mx.compile(
-        nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
+        nn.value_and_grad(model, lambda x, y: model.loss_train(x, y)),
         inputs=model.state,
         outputs=model.state,
     )
@@ -934,7 +998,8 @@ def main() -> None:
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
-        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings} "
+        f"stochastic_depth:{args.stochastic_depth_prob} pos_loss_min_weight:{args.position_loss_min_weight}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
