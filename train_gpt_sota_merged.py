@@ -1,3 +1,7 @@
+"""
+VOCAB_SIZE=8192 QK_GAIN_INIT=5.25 RECUR_LAYERS="3,4,5" RECUR_START_STEP=2000 MUON_WD=0.095 EMA_DECAY=0.9965 WARMDOWN_FRAC=0.72 SEED=1337 torchrun --standalone --nproc_per_node=1 train_gpt_sota_merged.py > sota_merged_legal_ttt.txt
+"""
+
 from __future__ import annotations
 import copy
 import glob
@@ -114,6 +118,12 @@ class Hyperparameters:
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    # 0 = update all layers; N > 0 = only update last N layers (selective freezing)
+    ttt_active_layers = int(os.environ.get("TTT_ACTIVE_LAYERS", "0"))
+    # EWC-lite anchor strength; 0.0 = disabled
+    ttt_anchor_lambda = float(os.environ.get("TTT_ANCHOR_LAMBDA", "0.0"))
+    # Skip TTT update for chunks with mean NLL below this; 0.0 = never skip
+    ttt_nll_threshold = float(os.environ.get("TTT_NLL_THRESHOLD", "0.0"))
     # Causal SLOT: per-batch delta optimization at last hidden layer (post-quantization)
     slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "0")))
     slot_lr = float(os.environ.get("SLOT_LR", 0.005))
@@ -1190,7 +1200,13 @@ def eval_val_score_first_ttt(
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
 ) -> tuple[float, float]:
-    """Score each chunk before adapting on that chunk's already-scored tokens."""
+    """Score-first chunked TTT with:
+    1. Selective layer freezing (TTT_ACTIVE_LAYERS): only last N layers' weights adapt.
+    2. EWC-lite anchoring (TTT_ANCHOR_LAMBDA): L2 penalty to pre-TTT quantized weights.
+    3. Perplexity-weighted chunk skipping (TTT_NLL_THRESHOLD): skip easy chunks.
+    4. Larger chunk / fewer epochs: tune TTT_CHUNK_TOKENS + TTT_EPOCHS env vars.
+    5. Per-chunk momentum reset: fresh SGD state for every chunk.
+    """
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     ttt_chunk = args.ttt_chunk_tokens
@@ -1208,18 +1224,47 @@ def eval_val_score_first_ttt(
         chunk_idx = min(scored_start // ttt_chunk, num_chunks - 1)
         chunk_windows[chunk_idx].append(ws)
 
+    # --- Change 1: Selective layer freezing ---
+    # The model uses banked weights (qo_bank, kv_bank, mlp_up_bank, mlp_down_bank).
+    # We cannot set requires_grad on bank slices, so we freeze early block-level
+    # per-block params (q_gain, ln, skip_gate, attn_gate …) up front, and zero out
+    # bank gradient slices for frozen layers after each backward pass.
+    n_layers = args.num_layers
+    active = args.ttt_active_layers
+    # Clamp: 0 or >= n_layers means all layers are active
+    n_freeze = max(0, n_layers - active) if 0 < active < n_layers else 0
+
+    for i, block in enumerate(base_model.blocks):
+        for p in block.parameters():
+            p.requires_grad_(i >= n_freeze)
+
+    # Embeddings, banks, and top-level norms are always trainable
+    for name, p in base_model.named_parameters():
+        if not name.startswith("blocks."):
+            p.requires_grad_(True)
+
+    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+
     log0(
-        f"legal_ttt:start chunks={num_chunks} lr={args.ttt_lr} "
-        f"epochs={args.ttt_epochs} momentum={args.ttt_momentum}"
+        f"legal_ttt:start chunks={num_chunks} lr={args.ttt_lr} epochs={args.ttt_epochs} "
+        f"momentum={args.ttt_momentum} active_layers={active or n_layers}/{n_layers} "
+        f"anchor_lambda={args.ttt_anchor_lambda} nll_threshold={args.ttt_nll_threshold} "
+        f"trainable_params={sum(p.numel() for p in ttt_params)}"
     )
+
+    # --- Change 2: EWC-lite anchor snapshot (once before any updates) ---
+    anchor: dict[str, Tensor] | None = None
+    if args.ttt_anchor_lambda > 0.0:
+        anchor = {
+            n: p.detach().clone()
+            for n, p in base_model.named_parameters()
+            if p.requires_grad
+        }
+
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    ttt_params = [p for p in base_model.parameters()]
-    for p in ttt_params:
-        p.requires_grad_(True)
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
 
     for chunk_idx, windows in enumerate(chunk_windows):
         if not windows:
@@ -1230,6 +1275,9 @@ def eval_val_score_first_ttt(
         my_e = (len(windows) * (rank + 1)) // world_size
         my_windows = windows[my_s:my_e]
 
+        # --- Scoring pass: always runs first (legal) ---
+        chunk_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        chunk_token_count = torch.zeros((), device=device, dtype=torch.float64)
         base_model.eval()
         with torch.no_grad():
             for bi in range(0, len(my_windows), batch_seqs):
@@ -1257,7 +1305,10 @@ def eval_val_score_first_ttt(
                     s = 0 if ws == 0 else max(wlen - stride, 0)
                     scored_nll = nll[i, s:wlen].to(torch.float64)
                     loss_sum += scored_nll.sum()
-                    token_count += float(wlen - s)
+                    chunk_loss_sum += scored_nll.sum()
+                    count = float(wlen - s)
+                    token_count += count
+                    chunk_token_count += count
                     tgt = y_batch[i, s:wlen]
                     prev = x_batch[i, s:wlen]
                     tb = base_bytes_lut[tgt].to(torch.float64)
@@ -1265,48 +1316,86 @@ def eval_val_score_first_ttt(
                     byte_count += tb.sum()
 
         is_last_chunk = chunk_idx == num_chunks - 1
-        if not is_last_chunk and args.ttt_epochs > 0:
-            base_model.train()
-            chunk_seqs = (chunk_end - chunk_start) // seq_len
-            if chunk_seqs > 0:
-                cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * chunk_idx / max(num_chunks - 1, 1)))
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = cos_lr
-                my_seq_s = (chunk_seqs * rank) // world_size
-                my_seq_e = (chunk_seqs * (rank + 1)) // world_size
-                my_chunk_seqs = my_seq_e - my_seq_s
-                for _ in range(args.ttt_epochs):
-                    for bs in range(0, my_chunk_seqs, batch_seqs):
-                        be = min(bs + batch_seqs, my_chunk_seqs)
-                        actual_bs = my_seq_s + bs
-                        start_tok = chunk_start + actual_bs * seq_len
-                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                        if end_tok > val_tokens.numel():
-                            continue
-                        local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
-                        x = local[:-1].reshape(-1, seq_len)
-                        y = local[1:].reshape(-1, seq_len)
-                        optimizer.zero_grad(set_to_none=True)
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            loss = base_model(x, y)
-                        loss.backward()
-                        if world_size > 1:
-                            for p in ttt_params:
-                                if p.grad is not None:
-                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                        torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
-                        optimizer.step()
+        if is_last_chunk or args.ttt_epochs <= 0:
+            continue
+
+        # --- Change 3: Perplexity-weighted chunk skipping ---
+        # Sync chunk NLL across ranks before deciding to skip
+        nll_t = chunk_loss_sum.clone()
+        tok_t = chunk_token_count.clone()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(nll_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
+        chunk_mean_nll = (nll_t / tok_t.clamp_min(1.0)).item()
+        if args.ttt_nll_threshold > 0.0 and chunk_mean_nll < args.ttt_nll_threshold:
+            continue  # easy chunk — skip adaptation, save compute for hard ones
+
+        # --- Change 5: Per-chunk momentum reset (fresh optimizer each chunk) ---
+        # New SGD instance = zero momentum buffer, clean slate for each chunk.
+        cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * chunk_idx / max(num_chunks - 1, 1)))
+        optimizer = torch.optim.SGD(ttt_params, lr=cos_lr, momentum=args.ttt_momentum)
+
+        base_model.train()
+        chunk_seqs = (chunk_end - chunk_start) // seq_len
+        if chunk_seqs <= 0:
+            continue
+        my_seq_s = (chunk_seqs * rank) // world_size
+        my_seq_e = (chunk_seqs * (rank + 1)) // world_size
+        my_chunk_seqs = my_seq_e - my_seq_s
+        for _ in range(args.ttt_epochs):
+            for bs in range(0, my_chunk_seqs, batch_seqs):
+                be = min(bs + batch_seqs, my_chunk_seqs)
+                actual_bs = my_seq_s + bs
+                start_tok = chunk_start + actual_bs * seq_len
+                end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
+                if end_tok > val_tokens.numel():
+                    continue
+                local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
+                x = local[:-1].reshape(-1, seq_len)
+                y = local[1:].reshape(-1, seq_len)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = base_model(x, y)
+                # --- Change 2: EWC anchor regularisation ---
+                if anchor is not None:
+                    reg = sum(
+                        (p - anchor[n].to(dtype=p.dtype)).pow(2).sum()
+                        for n, p in base_model.named_parameters()
+                        if p.requires_grad and n in anchor
+                    )
+                    loss = loss + args.ttt_anchor_lambda * reg
+                loss.backward()
+                # --- Change 1: Zero bank gradients for frozen layers post-backward ---
+                if n_freeze > 0:
+                    for bank_attr, second_half in (
+                        ("qo_bank", True),   # shape (2*n, dim, dim): Q first, O second
+                        ("kv_bank", True),   # shape (2*n, kv, dim): K first, V second
+                        ("mlp_up_bank", False),   # shape (n, mlp, dim)
+                        ("mlp_down_bank", False),  # shape (n, dim, mlp)
+                    ):
+                        bank = getattr(base_model, bank_attr, None)
+                        if bank is not None and bank.grad is not None:
+                            bank.grad[:n_freeze].zero_()
+                            if second_half:
+                                bank.grad[n_layers:n_layers + n_freeze].zero_()
+                if world_size > 1:
+                    for p in ttt_params:
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
+                optimizer.step()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
-    val_loss = (loss_sum / token_count).item()
-    bits_per_token = val_loss / math.log(2.0)
-    tokens_per_byte = token_count.item() / byte_count.item()
+    # Restore all params to trainable (clean up for any post-TTT code)
     for p in base_model.parameters():
         p.requires_grad_(True)
     base_model.eval()
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
     return val_loss, bits_per_token * tokens_per_byte
 
 
