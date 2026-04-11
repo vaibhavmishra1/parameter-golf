@@ -108,19 +108,10 @@ class Hyperparameters:
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))  # k for int6 matrices
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 20.0))     # k for int8 embeddings
-    # TTT: AdamW test-time training (pre-quantization, on EMA model)
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.0003))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 18))
-    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
-    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 1))
-    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
-    ttt_cosine_decay = bool(int(os.environ.get("TTT_COSINE_DECAY", "1")))
     # Causal SLOT: per-batch delta optimization at last hidden layer (post-quantization)
     slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "0")))
     slot_lr = float(os.environ.get("SLOT_LR", 0.005))
     slot_steps = int(os.environ.get("SLOT_STEPS", 8))
-    ttt_soup_k = int(os.environ.get("TTT_SOUP_K", 1))
     recur_layers = os.environ.get("RECUR_LAYERS", "3,4,5")
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 2000))
 
@@ -1178,69 +1169,6 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
-def ttt_adapt_adamw(
-    args, base_model: nn.Module, device: torch.device,
-    val_tokens: Tensor, rank: int = 0, world_size: int = 1, log0=print,
-) -> None:
-    """AdamW TTT: fine-tune on val data BEFORE quantization (PR #1006 style)."""
-    seq_len = args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // seq_len
-    batch_seqs = args.ttt_batch_seqs
-    if args.ttt_freeze_blocks > 0:
-        for i, block in enumerate(base_model.blocks):
-            if i < args.ttt_freeze_blocks:
-                for p in block.parameters():
-                    p.requires_grad_(False)
-    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
-    log0(f"ttt_adamw:params trainable={sum(p.numel() for p in ttt_params)} "
-         f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
-    optimizer = torch.optim.AdamW(ttt_params, lr=args.ttt_lr, weight_decay=0.0)
-    scheduler = None
-    if args.ttt_cosine_decay:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.ttt_epochs, eta_min=args.ttt_lr * 0.1)
-    my_start = (total_seqs * rank) // world_size
-    my_end = (total_seqs * (rank + 1)) // world_size
-    base_model.train()
-    t0 = time.perf_counter()
-    for epoch in range(args.ttt_epochs):
-        epoch_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-        epoch_tokens = torch.zeros((), device=device, dtype=torch.float64)
-        for bs in range(my_start, my_end, batch_seqs):
-            be = min(bs + batch_seqs, my_end)
-            raw_start = bs * seq_len
-            raw_end = be * seq_len + 1
-            if raw_end > val_tokens.numel():
-                continue
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64)
-            x = local[:-1].reshape(-1, seq_len)
-            y = local[1:].reshape(-1, seq_len)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = base_model(x, y)
-            loss.backward()
-            if world_size > 1:
-                for p in ttt_params:
-                    if p.grad is not None:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-            torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
-            optimizer.step()
-            epoch_loss_sum += loss.detach().to(torch.float64) * float(y.numel())
-            epoch_tokens += float(y.numel())
-        if world_size > 1:
-            dist.all_reduce(epoch_loss_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(epoch_tokens, op=dist.ReduceOp.SUM)
-        epoch_avg_loss = epoch_loss_sum.item() / max(epoch_tokens.item(), 1)
-        if scheduler is not None:
-            scheduler.step()
-        log0(f"ttt_adamw:epoch {epoch+1}/{args.ttt_epochs} loss:{epoch_avg_loss:.4f} "
-             f"time:{time.perf_counter() - t0:.1f}s")
-    for p in base_model.parameters():
-        p.requires_grad_(True)
-    base_model.eval()
-    log0(f"ttt_adamw:done elapsed={time.perf_counter() - t0:.1f}s")
-
-
 def generate_autoregressive_calib(model, device, num_seqs=64, seq_len=2048,
                                    vocab_size=1024, temperature=0.8, batch_size=8, seed=42):
     """Generate sequences autoregressively from the model for GPTQ calibration.
@@ -2190,65 +2118,6 @@ def main() -> None:
         f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
     )
-    # AdamW TTT: fine-tune EMA model on val data BEFORE quantization
-    if args.ttt_enabled:
-        if distributed:
-            dist.barrier()
-        pre_ttt_sd = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
-        K = args.ttt_soup_k
-        if K > 1:
-            log0(f"ttt_soup:K={K} bootstrap TTT (each variant uses ~80% of val data)")
-            soup_states: list[dict[str, torch.Tensor]] = []
-            seq_len = args.train_seq_len
-            total_seqs = (val_tokens.numel() - 1) // seq_len
-            for ki in range(K):
-                base_model.load_state_dict({k: v.to(device) for k, v in pre_ttt_sd.items()}, strict=True)
-                rng = torch.Generator().manual_seed(args.seed + ki * 7919)
-                mask = torch.rand(total_seqs, generator=rng) < 0.8
-                keep_indices = mask.nonzero(as_tuple=True)[0]
-                chunks = []
-                for idx in keep_indices:
-                    start = idx * seq_len
-                    end = start + seq_len + 1
-                    if end <= val_tokens.numel():
-                        chunks.append(val_tokens[start:end])
-                subset_tokens = torch.cat(chunks) if chunks else val_tokens
-                log0(f"ttt_soup:variant {ki+1}/{K} seqs={len(chunks)}/{total_seqs} ({100*len(chunks)/total_seqs:.0f}%)")
-                t_ttt = time.perf_counter()
-                ttt_adapt_adamw(
-                    args, base_model, device, subset_tokens,
-                    rank=rank, world_size=world_size, log0=log0,
-                )
-                torch.cuda.synchronize()
-                log0(f"ttt_soup:variant {ki+1} elapsed={time.perf_counter() - t_ttt:.1f}s")
-                soup_states.append({k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()})
-            avg_sd = {}
-            for key in soup_states[0]:
-                stacked = torch.stack([s[key].float() for s in soup_states])
-                avg_sd[key] = (stacked.sum(0) / K).to(dtype=soup_states[0][key].dtype)
-            base_model.load_state_dict({k: v.to(device) for k, v in avg_sd.items()}, strict=True)
-            log0(f"ttt_soup:averaged {K} variants")
-            del soup_states, avg_sd
-        else:
-            log0(f"ttt:start lr={args.ttt_lr} epochs={args.ttt_epochs} "
-                 f"freeze_blocks={args.ttt_freeze_blocks} cosine_decay={args.ttt_cosine_decay}")
-            t_ttt = time.perf_counter()
-            ttt_adapt_adamw(
-                args, base_model, device, val_tokens,
-                rank=rank, world_size=world_size, log0=log0,
-            )
-            torch.cuda.synchronize()
-            log0(f"ttt:elapsed={time.perf_counter() - t_ttt:.1f}s")
-        t_ttt_diag = time.perf_counter()
-        ttt_diag_loss, ttt_diag_bpb = eval_val(
-            args, base_model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
-        torch.cuda.synchronize()
-        log0(f"DIAGNOSTIC post_ttt val_loss:{ttt_diag_loss:.4f} val_bpb:{ttt_diag_bpb:.4f} "
-             f"eval_time:{1000.0 * (time.perf_counter() - t_ttt_diag):.0f}ms")
-        if distributed:
-            dist.barrier()
     full_state_dict = base_model.state_dict()
     export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
