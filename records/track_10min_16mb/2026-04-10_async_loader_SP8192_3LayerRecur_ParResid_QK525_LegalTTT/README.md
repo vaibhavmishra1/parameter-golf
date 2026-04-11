@@ -1,6 +1,6 @@
 # Record: SP8192 + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal TTT + Asynchronous Data Loader
 
-**val_bpb = 1.0810** (3-seed mean, std 0.0002) | **~15.99 MB** | 8xH100 SXM
+**val_bpb = 1.0803** (3-seed mean, std 0.0002) | **~15.99 MB** | 8xH100 SXM
 
 ## 2-Seed Results
 
@@ -28,7 +28,7 @@ Note: As this submission focuses on system optimizations and preserves the ML lo
 
 ## Details
 This submission introduces two system optimizations, both of `ShuffledSequenceLoader`:
-1. Migrated all `next_batch` logic to `numpy` to enable vectorized pre-processing. By calling `torch.from_numpy` only at the final return, we reduced `aten::copy_` overhead by 50% on 1xH100 benchmarks.
+1. Migrated all `next_batch` logic to `numpy` to prevent redundant copies. By calling `torch.from_numpy` only at the final return, we reduced `aten::copy_` overhead by 50% on 1xH100 benchmarks.
 2. Implemented a multi-threaded producer-consumer queue for batch loading. Worker threads pre-fetch and pin memory to the GPU device asynchronously. This hides the latency of CPU-to-GPU data movement and eliminates compute-starvation during the `next_batch` call.
 
 ## Compliance
