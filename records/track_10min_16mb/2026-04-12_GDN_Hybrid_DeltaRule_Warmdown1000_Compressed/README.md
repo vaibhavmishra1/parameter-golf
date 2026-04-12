@@ -1,9 +1,5 @@
 # GDN-Hybrid + Sliding Window Attention + compressed-code warmdown1000 (cold-cache 3-seed mean 1.01671233 BPB)
 
-Three-seed confirmation run for the repaired GDN-Hybrid family.
-
-## Headline result
-
 - **3-seed mean:** **1.01671233 BPB**
 - **3-seed std:** **0.00134386 BPB**
 - **Best seed:** **1.015700 BPB** (`seed 1337`)
@@ -20,12 +16,6 @@ Three-seed confirmation run for the repaired GDN-Hybrid family.
 | **Mean** | — | **1.007787** | **1.01671233** | **1.021806** | **15,783,555.33** |
 | **Std (sample)** | — | — | **0.00134386** | — | — |
 
-## Why this matters
-
-- Improves the prior 3-seed artifact `run039-safe019` (**1.01710033 BPB**) by **0.00038800 BPB** while also reducing the worst-case artifact size from **15,981,262** to **15,903,365** bytes.
-- Confirms that the compressed-code warmdown1000 repair generalizes cleanly across a fresh 3-seed cold-cache confirmation run rather than only a single hard-seed probe.
-- Preserves the strongest version of this clean fixed-predictor GDN-Hybrid family so far.
-
 ## Technique stack
 
 1. **SP1024 tokenizer** with a GDN-hybrid backbone (`[GDN×5] → SWA → [GDN×5] → SWA_shared`).
@@ -34,8 +24,6 @@ Three-seed confirmation run for the repaired GDN-Hybrid family.
 4. **GPTQ int6 + zstd-22** packaging.
 5. **Compressed-code record packaging** for `train_gpt.py`, `architectures.py`, and `configs.py`, which recovered artifact-size headroom without changing the trained model family.
 6. **Sliding-window attention side path** present in-model, but submission authority remains the pulled `quantized_bpb` values above.
-
-## Legality notes
 
 This record uses a fixed int6 model with **no TTT, no SLOT, no RLS, and no eval-time adaptation**. All three serialized artifacts are below the 16 MB cap. XSA telemetry is reported for completeness, but the submission authority remains `quantized_bpb`.
 
