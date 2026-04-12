@@ -2,7 +2,7 @@
   "author": "Joshua Martinez",
   "github_id": "joshkmartinez",
   "name": "GDN-Hybrid: Gated DeltaNet + Sliding Window Attention (compressed-code warmdown1000 cold-cache confirmation)",
-  "blurb": "Cold-cache confirmation of the repaired GDN-Hybrid family. Pulled TensorPool artifacts for run051-safe031 / j-bunuyb7fxu show a 3-seed mean quantized_bpb of 1.01671233 (std 0.00134386) with all artifact sizes under 16,000,000 bytes.",
+  "blurb": "Cold-cache confirmation of the repaired GDN-Hybrid family. This record reports a 3-seed mean quantized_bpb of 1.01671233 (std 0.00134386) with all artifact sizes under 16,000,000 bytes.",
   "date": "2026-04-12T22:30:00Z",
   "baseline_pr": 1545,
   "evaluation": "quantized_bpb",
@@ -38,5 +38,4 @@
       "steps": 2227
     }
   ],
-  "artifact_authority": "state/tp-pulls/run051-safe031/artifacts/train_seed42.log,state/tp-pulls/run051-safe031/artifacts/train_seed1337.log,state/tp-pulls/run051-safe031/artifacts/train_seed2024.log"
 }

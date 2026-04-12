@@ -1,6 +1,6 @@
 # GDN-Hybrid + Sliding Window Attention + compressed-code warmdown1000 (cold-cache 3-seed mean 1.01671233 BPB)
 
-Three-seed confirmation run for the repaired GDN-Hybrid family, reconciled from pulled TensorPool artifacts for `run051-safe031` / `j-bunuyb7fxu`.
+Three-seed confirmation run for the repaired GDN-Hybrid family.
 
 ## Headline result
 
@@ -39,12 +39,9 @@ Three-seed confirmation run for the repaired GDN-Hybrid family, reconciled from 
 
 ## Legality notes
 
-This record uses a fixed int6 model with **no TTT, no SLOT, no RLS, and no eval-time adaptation**. The pulled logs show all three serialized artifacts below the 16 MB cap. XSA telemetry is reported for completeness, but the submission authority remains `quantized_bpb` from the pulled artifacts.
+This record uses a fixed int6 model with **no TTT, no SLOT, no RLS, and no eval-time adaptation**. All three serialized artifacts are below the 16 MB cap. XSA telemetry is reported for completeness, but the submission authority remains `quantized_bpb`.
 
 ## Provenance
 
-- **TensorPool job:** `j-bunuyb7fxu`
-- **Canonical bundle:** `~/parameter-golf-project/jobs/run051-safe031/`
-- **Pulled artifacts:** `~/parameter-golf-project/state/tp-pulls/run051-safe031/artifacts/`
-- **Parent repair probe:** `run050-safe030` / `j-br75brdy6j`
+- **Parent repair probe:** compressed-code warmdown1000 single-seed repair on the same family
 - **Upstream source PR:** `openai/parameter-golf#1545`
