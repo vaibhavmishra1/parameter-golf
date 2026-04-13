@@ -65,10 +65,10 @@ from configs import get_config
 
 class Hyperparameters:
     arch_mode = os.environ.get("ARCH_MODE", "D")
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "/workspace/parameter-golf/data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 42))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -1047,6 +1047,7 @@ def main():
     log0(f"EMA BPB (no XSA): {val_bpb_ema:.6f}")
 
     if master_process:
+        os.makedirs(args.ckpt_dir, exist_ok=True)
         torch.save(base_model.state_dict(), os.path.join(args.ckpt_dir, f"final_model_{config['arch_name']}_seed{args.seed}.pt"))
         log0("Saved raw EMA model")
 
