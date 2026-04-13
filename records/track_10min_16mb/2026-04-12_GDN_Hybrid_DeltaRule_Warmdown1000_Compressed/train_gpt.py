@@ -1049,6 +1049,16 @@ def main():
     if os.path.exists(stale_marker):
         os.remove(stale_marker)
 
+    # ─── Pre-warm Triton cache (FLA GDN kernels + torch.compile) ────────
+    log0("Pre-warming Triton cache...")
+    _warmup_t = time.time()
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        dummy_x = torch.zeros(1, 64, dtype=torch.int64, device=device)
+        dummy_y = torch.zeros(1, 64, dtype=torch.int64, device=device)
+        _ = base_model(dummy_x, dummy_y)
+    torch.cuda.synchronize()
+    log0(f"Triton cache warmed in {time.time()-_warmup_t:.1f}s")
+
     log0(f"\n{'='*80}")
     log0(f"Starting training: max {args.iterations} steps (from step {start_step})")
     log0(f"Wallclock budget: {args.max_wallclock_seconds}s")
