@@ -1,5 +1,637 @@
-import base64, lzma, linecache
-globals()['__file__'] = 'architectures.py'
-_src = lzma.decompress(base64.b85decode(b'{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;A7bs%Uu8wXbs4O{*J2g^P4X}8A*?nKeo}D<QO>((oAtmlzXSM1Ig2`L`+cv@?w-@3r2bpI{8yz9`;@SXxb8{$fRtA3$`M_7l-P&$A)VpsI<{M1(k?)Sp%fgGHf{OA(e1{%%h>U(XyoMXIPp+maZ<`Y6aE!)~96}-?&KS_k=U~h?SsP>3(#hSXx;Gb}nY(jTA3=m<)>eOpgmMpv(N6Jw4N1{;sYZhPMhU0&O&Da!-;hJL0RkdivHzjmv^(5uZsfYeq27zGmIe`KoOHIQuYUjFMPp8l;u48XK7Wszs%jwMD3Ag^3BFZA|PV)yGfF&9VH-(s2Q|eiU=*2gP#b(g1_keckp+RTd1ebYAlkI_Q(1KdgIzo^2Ajexh6Vo<-BmT64<v4-1-B@Zcy2g-N}82Q<Ea*=hw3AZ>)g?{FY-8_?)s$@TwD&jnwEE94uXTfL)k!^9qGM3)Q`34S(SfW9B%*GWL@QNjM=A7Q9M@<u(gRT%zP@#PE!V{C+UBo+1IHl|$&CKbB<9~V0pkE~35`x<jBHXC}G)3sBisMOXu$^%bGFSi`<f~Bd4%sn={P=e{86L<@A<n--1wB}LOJz25ZlC_=nzccg{Rl}=S)3M6&X1NoN>9S#*t9C)TqR=33=ksZTjaD+X4M-pW80`pt#r_W8U_;|k+Ua{=p6)56RyNUVjjaM=XPL{;3+Y<$iDw6ztH0YE_r!|+t|eW=X<2P0w{@zd5iBFY$CTrD*n+ol+(E42zm}zhsa#B?qtO=*Lc{nP&hfDdkRtQ=Ep3rLq>hVos*{y!iUw=w2kYqLrMkW!EgT-IHvop$I@64dqxYqCV@_2s5AjSTf;6;^g}%+S<b`Qlt)i$@u^$(%=<Fn^$~BO+_|0snc?HA~$-Ti$=^!Tfm~Jpf1xjpCNVbO#!Oq?1Dt<LPzo-LQgJ(5gaj6CQwPbR{*wHUXA6$Oyt`%y#MgUM#!UXz)%o#5@p~zjNN;Jrc;n2+g=%K2-n=5zHKFi4zka>Zf;6p2bFm~5gVdaZ;l6u*JAf0kul^?N2uz0!sG3i*0K+|_D7}U1uB^#T(Yj%9S7V277Q}3e^KEP|TnWsSNT!n98yW)qh?F`Dne{<Yd1xy3SY#uYTFg`Gj+SGdkCCBPoH0p&1O@jA7plGXa)Mq+MjT+dxJqr!g(!@l`OV>&h-HQW_;jl)yQ(JD0+=SXB6lPhIl5y&+;)mb@J7se?c1nHe2f;xjtWiwr%87?ToT05m1D7Ht^7wfyHwC&oUu|2#kt3@McM!NN*Xc(8l3poPj324}xWH7HqS;NT18Ws9RV~4Jb>@o!@qB$3Rod_D-2^PR;B@BW*;pxUq=9KFG^`q&c=d>!=yylYsps!c<pZN}!NhMnN{~GJIrND%t-DTGz)wKBgH4AJY*7d^FyqK~@{a~puQzF;@vMm_nCih6o=v8~gI3otWAl%rWCqUSJ6);n)Ef9N0C|DI4tWZc^)Lw7eHWzO#k_VR3VF}2DvvASmgC<&p`7N=oYe#$d$yl{ynjYr4-5HF`DW8nA-h4Oj1GLGQGH5=dV($~R5)q;33CtFcM1>DqUp&i52VmLj6d^p4h8b^NT6U4z9CbVh$=ki+|kz+>sEkqyPVAkwo(WKMju~!K33A^GmP{d5wpd}cC<c0BF>>rGEH^_v|sZC>pk-|TC&?x5C&1Rrf_c^uk4hePX(VYWmHYq2yxenyjs>Yfo1y@K2Xm;pgPofy-WD7x^L`xCmBLInjBy|B5rtRG7`-X_RQx_vA!=wCi5)p_NE$)u#5le=Kip=y)gOL{>W!g584gaFlfPn2Mm`OuckQXPoC`4ykJQ?t?T~;IPnr@c6(Y0>Xi(9;rSI3(mK55h2yOusT&))QSD}Xr$z@0jT(LP!Z8jfo5%LAlprOO7;9m>d9})Qqc99#5Y$8$n!Oca<Hw2wMR8E-=mr`fW{T_@y8%GS<#1XT8NzM0$g~1tg{9rg%C){FzX(U6X#auj+D$l5jV0Ss-4@%z;)(@gYv6`-<G}F>g9SJ|J(&AkT9tR3=Ep8tYdo=BP$nEgDSOrG2*Uq%bHKitAx#+Ox%d78EPqpwjakDR+Dr!tnkELJ>vP9y;{XLy;%eyP9P@bC*dDiovwN|2OvUL5|ICP)ik0h;e=q<7iKiW2(+=ipjVsA%Pm5lk8}(T+hMK!GrqWo6mWTqJjgnh;h8&w3Z6jO=ORx!i`I#8ku6W*#@azgGJjEFo@ZeoRuq$0W!%8xJ?=Kr=H~3nLT`CZF(}?vt+0&L@w3j`2UpupFq;As;(s%VL1G}Y!UFNn#ueXiv06o}s21CoicTpwuuVeOz75vlEsW%_<QuA+H8P?GACiUkRgMGO|+Ww<*>(K#<Lx3aF=6eqf;3gQ}<ArSb{ItG|J=C!^+q*t@z@9N%AIb?)XEh~26$_$w=Ez+X+!)7r?|0(W11JJQbYgp{wX;2p`1+<a6PiG4Ls3vFit1qyRwLR>f5hlGL#P1P0#0h|z(EZidY3Z8dMji`PH&efpmyR-o?}(jL`3gmDksLIN$l}HL_7S*h~v{e6xsM3a_zc&5~tYyPn|q0(A{fJx}h4x{?J+=Kzj`#?i5q!K6NZy1OIDyReIZr^o8JPPlV6hY@fJB8vbE<uqRaaJsmhpP6|#JOX%v4D2(Wf(shGg?MvQ=6d~&e*{G<8y|(1M#g!t5n>&JuS72MPoTMbu{uoW)YXTJy_`|NXcDT1mgP%}3oj$nc?vPe-m|cPH5DvMkj=T`32U1H?b&!Cai5c@^>mFTtU(q;h_Srv2GN+>N-!`S-qe`6yhU`4v&-`Zf1vmg6DOleRZ~=7PiYtq0xqkDAs1^CmavP3W=1rYCO^60AD17J<L1>NN*DO@eqx3EQ`meU=>bQ+}A^PKmF3)1d@zn1FqVE*3t2MZ>lDV(JO&LEMhl)<l32)#M#1RNJ)C>?7qmOO%lI&Byxq`w__IVlA+oaI4yAP~CY1%&f`4TTAxcT6#bGA?~utOF<)!z7&Uc5J8o&=;`I0_c%&O7lxa`;KyQBtc=v;6(+C~@~I-0h)Pklxj2{t+K*0b^vtA%r|VB(kekV4P=(+)bGWe5QIezx}!<l1b0*-wzK1=FCT~!2tVA@ymFeM5?7X$C&)cI{1Mc`Zb5kmI5bN3kYEo;2)W!yPdA$zuRWE3KcS=sx%~u!%F@ng!{-FQ`QD(4mA$qsus5B9=cGp{;b6Yw~%2JW{ByNvPmG2-5)2OY?mEW;J8xTI@joSgNEPnFu80XHXG3+Ruqz&wO5iL=j}1g?$C0lHVBSXcj(wl!9C$_wKO+d__}*yp%o7CYJkx=!`H&iX54R9WZ<Pp{FPkFtQ{BB=F=-yd)C5%4CxJ|)#?7LEAKjzcSYqhpT~wSzVS9Gwc@%~8J^h~iK5ZxkBw+Tn?h@zscii#g?$D1g<rN<s%5;fFA9L#Vmh1eK5sdGEI0F;P(?V$u@x2lr}QxTI~SB~q8uP4S@W>&X}#)nCr|F>@$j+G<rRiFM|u!;tBkA>n&w86a8m4=i_-z``GsN9()Fg#o2F|P*D)ivEjUV>Ii^x)CY)P!er`IvAsr1PSZrqUwq*?>JMP-aa(VP?Y`}EA0{pD_VYM>t&J4lqU#?>MC-ZE94FVL<UIn3rr>#)WRp}ym5u$zku}HFYK^f|e8*?;gE$fQ$g-=xai0%n#7!{L^7gyoh_RQ-uSD6Zr`O8?{`Bs>&WZEo2&+eRHw2LpjTu+#ef^s_DBpj&NUua7j=EgZH(bR945C$%@ZZLQ^c-gF0bMI_BtQxdZC>LFk-5F^;S3~Lq6MdhzPLYzlUvzGWJJKMFeq1Ne7!$^F+-(Fpeyhelf_G6bHf8;ZGVidY_ko-k8M@de+KHwM3|h})k)Y>0rzcDk%{k?+2Om?kA`nFUp5ydxZ3HUfwvftwoBG}<oty@%e%lva9h!-%pz4e;1g(h(1msuu;VxLq21iM*9eHDHWkAo6wpPCxRb6yGBp;MR#KYxw(s?JC^$@df3cEI%5y=cBh731+Zir^v?DT}*Ve(F{RKg$9f=^Xsz5TZ_%4hrhDvlx6v24c{#4`CLpuRALavL;Xoh&XZ+5Rl6TdpM4y8ONI!~Rv^)2^r0VWdSdnv1_-;$3pdnB$p2{hUs70TaP>Dk0$%IJEGyMm@zZm~kF|5PF;9`zDGw7gLuzP82|o0yyo`ZdH>sL3u2P&o7}?C2C^PZ3myM-DPK)MS^7ikg0XYSiiNc1DMuW8$WCb*7Iy^>jLH$!uP3v5*g*eN=L2B^7pl9@53$H&cEV5i`ev*&$3ZCZi2<gGa1Th!a8>zhED2vUfz<p_qol0K$%a1DJ%Ltvte)4^}D2LG(7IWip+DHZ1{U-*2uNm&Z(6jcAq|R&VSIAFLrdY%kCdG5EMYlwN+{yZ9JQ$1{P!~n>7f`VwL+_`2+UD0LAy^9r;IcJp|FF<R(;JEM9+`-S=ldW>H2_YRp42GchCW1&r>Llk7as4FQh#y~L;lp20-;&-ZSzR*4Nt@MU~O5hK(+@9rQ?Ofq`;i)w<&D;(t-%agZq-U3vMviP}g<pm#*oHTqULUUq60Xhy71;cYy%X!e0C9@Ud*Srx!i3;5)-FbC3vmCq6g(AeH`DByozcER*b`$1&ed7Qh>Icwv0ry_`#uSdQa()%F&Jy%ptAx}+@iu)78qNMfI(?JEO*f5)O-n>(VW&5IjzA*lWs(S>6uZ6TNOYKN11|YqS)(ljRR94GHeG+uJ#ipZp3!F3nI9S@&0Gxu3d(YkjaPn#O4sJUC4@~eG{3e%kMierjR2g_`htusm|mB5)Y?)NRB|>XYVr$4od!rGOhzb6HXk$Fe4-jnr=?AU#HNpv8lqu0KpeomI8)I!PU*_}Eqo1&q3Em@EqlI>MPuI$R7<?B5j)1u*yJ?aQlc<$DJ7386vN6rkVjfE=VMcK=8M9J88EqzsMBTUS&gUOhh+96&b9;_Wqv8&IzL4<<~fAPz>Q+D2pCybW{OtorvR;iBdUlx1MkRW{}FHsjWaS*(-GE973A#%V9?Yc7$fNmwpIzh7;7cbO3eVQNitYRK{}WiK3SPBZ>PRZP?i>OvK#oCGXWcm_&w?4xFI9>P-&+H*XbbRJ9k3r)&YxqN9*_OI=3JS9JgRy*CZ5C&7>Ews3w-?#Ea@1iy}1bEZ`+4vmPSXPoc|lejLHIoU%sL-w$ygnC_j6<<n)-wnN{R!gD=nK2btfMoQ$d8{(35!I;*)i#>DjfUvISBKCOYpjiYgd&995_C?GN6Tj=MXumdE5pq;`PK^FiVa9Q2b?>*e-MtQdhH-xZA`VjHtAZ?Pt@h!(YS3dvQu5{RF_8?i(*qKG;qz0H;1LWnQMd=^6x|yTDQ~|X0DkYu9DJfZO@AR&Gb^Y$o-t{50rkVm!Y@uz>f8EqSmB2np~O?XMG_+ZMfKa2SY@gBv(FynMU>}>%1uFDlhkXvHMlNP$*x+iS_;Xve#O;2d3aS3wPO29oe08K^Ykwt&1H=ERDD0`tc2sQf&m+B=_=DO|4m7TX+9lC96R2FE-L*0fnx?-Yf)>xbdtyp@o?8WsT!Jq@#D#s8Qr2U;pU>~21-#ZvNj+h7D1Sbqp!S`=%xcJ=Os-b;Pew)*Cp>J2-16oU!O;DR43+)p~a=k>+o>%p-CFfl}-RVA75zTo`{rqu@y{M_E*GbenUK0kRh@Kp%<-9-y60jZ5HOD25_4GD4VJ`%Rr~TIb1M@8^lLdE`8p1LCW-LH}ZV(B==Tsh`MNvfIM`{$NU?47L$t*QjoP2>LCt+d#1qTPVCCClPGMc9Xf?xWeG?64q(0tV^SEQX<vB)twN4sVp}B3P{OOV<Qgc>yRdKp@(>@x3=2n)HVdb*;ie%yr1H!y%vxF9jaP^8RUz9eCG@_b9{?rKWpQ{<W)Qze^=XHO2S;IX0E?6?T)>BL3?J0l`29|+<>~K*M1f6(vNaQN8rt?%u$T7BSZX)^TNcDPvRves2A%<fY`@JjTqAb8Q#$fUQw1Q~nb|c6ptd9E`dE-QUXtXz_4XAY86>%MpG0(Sr=Gv4j5_t50%ibaVnFY{*L5~!ZHYS#-}c<Rx_IR1k@c#GX6c@)Am*R0Z7K8Wa;r!Zr;k67S=93_w~)qx6-X4KB@94!R!rDSwyl%#=w~=a8bqlgYbKh3_9YZ4SOCLj=nLyz1}~czhtDE<b;mEPO%)vqvYa=Rs#qFmKY~)gfyttDcc`~=hW&&S8-8PRgq|qg_cf1jLFFyG`Cw&6-$V}yKg1qTgvW;l{&;jCL`W&I<rmAw_|ocF#UVmgba=UNn`z@QlJuOU&2&meSjdnCgsm$S6tDMhue29@p-J>9N7Jyv2+%rQU|QbiWnQodW6%sie}?-af1QRSSL2lC8mVgVj3|}%9j2SWE-UJA>GNU0AN2Fw3ifb(bL8d{T!^))d^Y)H5AkbE(EMiY$)x&GQ6Fpisw<+OKXb9`jj;>`P#l3#%Rb}g<ClJ0`%(0vTpQkj;)RMW9O}f7fLRP7Qz#9iHeKu@$$WYbTQes(pGET4_D`kiGl$6Tq*dc!&~-axVfq^XlX~s(I1;4ArdA*Pg`C4px^mH_Z%M~r;tNG2RS?jLqzq5G;Gku<0+h*^&K+QKh{Di<XU1@{+5_S4Q%PCRIEF1^`RIQPlj?D%-of1g&+Mp&(FwA<k6bbM@hR^RI7L#|<Q@gTSQ_5lp9*QbX?DE41d|X6F!KfybTpa(0}au__NJ5l8B{><u9SwridQDmraT+}YMQ6A-5y?q4AV}!FShrPOXHo9_kZYeN+-Zyt?w|G#JLyzJgCc0*jz~4x!zysE+F|cUo0i6XH#{eIfK`V5mnOFx%=DRT$%aV6?m=OTjSp1Wsjqy{0(gZV1%rJW!K-)dFa9rBEY#=y|P2(ZGILJ8vn!u08qkpR3{2O$T;n<LENL`^9Gs3{o`CUj%8QKx4DhWy^N3s9RhwQgUo9O>Lk21)TkQrqFCfO7)__6_EQiI+LeqisY={74y)gr+Z0OWyXJ|O`3v*~^^#A3&HNYKi2_#&l)GuH(e$VkJqE~bRpE6D8pj)1)Pa<JTBMg<49e`0RNtp@Jhj9$fWdaC2FJRx_GKiEg+W86emX=yb*~#V)xwXnFU)#SB4;8zA$}aUzuIlw!#;)NfR}v+)j7EKF?~`(G#x-wfrF=Ko=pObG!AJ3=B$1do+>3IA)${Bb9W;KBJ)pDVVL7{cdGE*T>C_PE}ZNHWrUbarV+~pL=7j!>NZxVqBVT(ICrMygQ-N8G;v*LAj0e>5Mhjq#(Z`Z;&fxC_9TQz=x<$7AOogW^`A7jJW;_r5IqZ$Bb|>@v~B&7&NGAQJ4O<;?uCxMSV=qU-Ism)5zjl`o^=yLf>(64MGO^z9M~$?N|q;%{j1wxL+6ctZ)TK40ELOxc^V|EGyEa=CqXK9IFaHo0cR&X)e<Lu1m36Wl;56UD7o=bt`6Cjq0r7rx&eo_wr2%+tVfSa{`{2<hhw0~_X4{<ScaO3v$EHM#UdJ$z}cRS{bkrMg}6sb*j3$9`Q*N|bGanaGu~-E1O==`R%5%EW3R^lFaeSl#pSuR`~b>QI+?Osg~f9j(P7w=>`hhB2oLhAwba|b^l$6Zw{BB3D%pICv~{&e^*@?yX%`kvM*}lFXjXF`QXN`V%%Lbi5gECrFIu$^j*rjGdh6c33!Lnx0H156gF$<(UCSY8hnwRqTu+?Q(Yq2{RF_@!|Cfhz`6nO321;32A40s#PAQid&SP&s=*eQ2cuA}g8ZFv;cP)S)yKG-wFkwU#LP614f$)#|>(^5-@fr-vlPHx&J@S}O8Q&gSdvrEOD?~m-oDbtouDTi?zxg||zS{xX#D@l3fs{L+IaFLTS7OEswe)16cOv!C0S-=R0c-51+&1Q;i7mT}4?&S3bFa(M8X-rgpf63<&Qa%5?XSs@RXSBPYB&La_icC`VZDlfF>rP?=<BU%sR&g4w(M&zgu`*!y|00<j)_f{7)~rc+}aJ!0s_R>TAq|bXq!vl_}3^Sdt_RTm|e4Jqe*@p^8H*fh-p$FYdl5_a%6$faS5bcqrL3XLP{O#VFkV&)A6g~_cTjOAOGor+Rs^v0Wpui4Aav$W_SPq!EW3W;+CKj00HMQ+Q$I^sD?+7vBYQl0ssI200dcD')).decode()
-linecache.cache['architectures.py'] = (len(_src), None, _src.splitlines(True), 'architectures.py')
-exec(compile(_src, 'architectures.py', 'exec'))
+"""GDN Hybrid Architecture — modular blocks using FLA native layers.
+
+Supports model variants for the Parameter Golf Direction-5 experiments.
+Each model is a stack of mixed {GDN, DeltaProduct, Mamba-2, SWA} blocks
+with shared MLP, RMSNorm, and residual connections.
+
+Key design choices:
+- FLA layers handle recurrent attention (GatedDeltaNet, GatedDeltaProduct, Mamba2)
+- Sliding Window Attention (SWA) uses flash attention with a causal window mask
+- All blocks follow the same pre-norm residual pattern for uniform gradient flow
+- Weight sharing for SWA layers in Griffin/Zamba-style models
+- forward_hidden() exposes (hidden_states, logits) for RLS eval
+"""
+from __future__ import annotations
+import math
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+# ─── FLA backend selection ──────────────────────────────────────────────────
+# Set FLA_USE_NAIVE=1 to force pure-PyTorch (naive) kernels instead of Triton.
+_USE_NAIVE = os.environ.get("FLA_USE_NAIVE", "0") == "1"
+
+if _USE_NAIVE:
+    import fla.ops.gated_delta_rule.chunk as _gdr_chunk
+    import fla.ops.gated_delta_rule.naive as _gdr_naive
+
+    def _patched_chunk_gated_delta_rule(
+        q, k, v, g, beta, scale=None, initial_state=None,
+        output_final_state=False, use_qk_l2norm_in_kernel=False, **kwargs
+    ):
+        if use_qk_l2norm_in_kernel:
+            q = F.normalize(q, p=2, dim=-1)
+            k = F.normalize(k, p=2, dim=-1)
+        return _gdr_naive.naive_chunk_gated_delta_rule(
+            q, k, v, g, beta,
+            chunk_size=64, scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
+
+    _gdr_chunk.chunk_gated_delta_rule = _patched_chunk_gated_delta_rule
+    import fla.layers.gated_deltanet as _gdn_layer
+    _gdn_layer.chunk_gated_delta_rule = _patched_chunk_gated_delta_rule
+
+    import fla.ops.gated_delta_product.chunk as _gdp_chunk
+    import fla.ops.gated_delta_product.naive as _gdp_naive
+
+    def _patched_chunk_gated_delta_product(
+        q, k, v, g, beta, num_householder=1, scale=None, initial_state=None,
+        output_final_state=False, use_qk_l2norm_in_kernel=False, **kwargs
+    ):
+        if use_qk_l2norm_in_kernel:
+            q = F.normalize(q, p=2, dim=-1)
+            k = F.normalize(k, p=2, dim=-1)
+        return _gdp_naive.naive_recurrent_gated_delta_product(
+            q, k, v, g, beta,
+            scale=scale, cu_seqlens=None,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            num_householder=num_householder,
+        )
+
+    _gdp_chunk.chunk_gated_delta_product = _patched_chunk_gated_delta_product
+    import fla.layers.gated_deltaproduct as _gdp_layer
+    _gdp_layer.chunk_gated_delta_product = _patched_chunk_gated_delta_product
+
+    print("[FLA] Using NAIVE (pure-PyTorch) kernels — set FLA_USE_NAIVE=0 for Triton", flush=True)
+
+# FLA imports
+from fla.layers import GatedDeltaNet, GatedDeltaProduct, Mamba2
+try:
+    from fla.layers import RWKV7Attention
+except Exception:
+    RWKV7Attention = None  # type: ignore
+
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+except ImportError:
+    def flash_attn_3_func(q, k, v, causal=False, window_size=(-1, -1)):
+        q2 = q.transpose(1, 2)
+        k2 = k.transpose(1, 2)
+        v2 = v.transpose(1, 2)
+        if k2.size(1) != q2.size(1):
+            rep = q2.size(1) // k2.size(1)
+            k2 = k2.repeat_interleave(rep, dim=1)
+            v2 = v2.repeat_interleave(rep, dim=1)
+        out = torch.nn.functional.scaled_dot_product_attention(q2, k2, v2, is_causal=causal)
+        return out.transpose(1, 2)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int | None = None, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.dim = dim
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+
+
+class CastedLinear(nn.Linear):
+    """Linear layer that casts input to weight dtype for mixed precision.
+    Supports late QAT (int6 STE) when _qat_enabled is set."""
+    _qat_enabled: bool = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(dtype=x.dtype)
+        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
+            with torch.no_grad():
+                w32 = self.weight.float()
+                row_max = w32.abs().amax(dim=1)
+                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -31, 31) * scale[:, None]).to(x.dtype)
+            w = w + (w_q - w).detach()  # STE: forward uses quantized, backward uses full
+        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        return F.linear(x, w, bias)
+
+
+class Rotary(nn.Module):
+    """RoPE embeddings for sliding window attention."""
+    def __init__(self, dim: int, base: float = 10000.0, max_len: int = 4096):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_len = max_len
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq.to(device))
+        cos = freqs.cos().to(dtype)
+        sin = freqs.sin().to(dtype)
+        return cos, sin
+
+
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """Apply RoPE to the input tensor."""
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    out1 = x1 * cos[:x.shape[-2]] - x2 * sin[:x.shape[-2]]
+    out2 = x2 * cos[:x.shape[-2]] + x1 * sin[:x.shape[-2]]
+    return torch.cat([out1, out2], dim=-1)
+
+
+class MLP(nn.Module):
+    """Feed-forward MLP with configurable activation."""
+    def __init__(self, dim: int, mult: float = 3.0, act: str = "relu_sq", leaky_slope: float = 0.5):
+        super().__init__()
+        hidden = int(mult * dim)
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        nn.init.zeros_(self.proj.weight)
+        self.act = act
+        self.leaky_slope = leaky_slope
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.fc(x)
+        if self.act == "leaky_relu_sq":
+            x = F.leaky_relu(x, negative_slope=self.leaky_slope)
+        else:
+            x = F.relu(x)
+        return self.proj(x.square())
+
+
+class SlidingWindowAttention(nn.Module):
+    """Sliding window causal attention for hybrid models.
+
+    Supports XSA (cross-segment attention) at eval time for extending context
+    across eval chunks. Window is enforced during training but can be relaxed at eval.
+    KV can be shared across layers (Zamba-style) by reusing the same module.
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        num_kv_heads: int = 4,
+        window_size: int = 512,
+        rope_base: float = 10000.0,
+        qk_gain_init: float = 1.5,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        kv_dim = num_kv_heads * self.head_dim
+        self.window_size = window_size
+
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        nn.init.zeros_(self.proj.weight)
+
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_xsa = False
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        """XSA: subtract self-value projection (GQA-aware)."""
+        B, T, H, D = y.shape
+        Hkv = v.size(-2)
+        group = H // Hkv
+        y_g = y.reshape(B, T, Hkv, group, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(-2)
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, T, H, D)
+
+    def forward(self, x: Tensor, v_embed: Tensor | None = None) -> Tensor:
+        B, T, D = x.shape
+        q = self.c_q(x).reshape(B, T, self.num_heads, self.head_dim)
+        k = self.c_k(x).reshape(B, T, self.num_kv_heads, self.head_dim)
+        v = self.c_v(x)
+        if v_embed is not None:
+            v = v + v_embed
+        v = v.reshape(B, T, self.num_kv_heads, self.head_dim)
+
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(T, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+
+        if q.is_cuda and q.dtype not in (torch.float16, torch.bfloat16):
+            q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
+
+        y = flash_attn_3_func(q, k, v, causal=True)
+
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v)
+
+        y = y.reshape(B, T, D)
+        return self.proj(y)
+
+
+class RecurrentBlock(nn.Module):
+    """Wraps any FLA recurrent layer (GDN, DeltaProduct, Mamba-2) with
+    pre-norm residual connection and MLP."""
+
+    def __init__(
+        self,
+        dim: int,
+        recurrent_layer: nn.Module,
+        mlp_mult: float = 3.0,
+        mlp_act: str = "relu_sq",
+        layer_idx: int = 0,
+    ):
+        super().__init__()
+        self.attn_norm = RMSNorm(dim)
+        self.mlp_norm = RMSNorm(dim)
+        self.recurrent = recurrent_layer
+        self.mlp = MLP(dim, mlp_mult, act=mlp_act)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.layer_idx = layer_idx
+
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+        recurrent_out = self.recurrent(self.attn_norm(x_in))
+        if isinstance(recurrent_out, tuple):
+            recurrent_out = recurrent_out[0]
+
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * recurrent_out
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out))
+        return x_out
+
+
+class AttentionBlock(nn.Module):
+    """SWA block with pre-norm residual and MLP."""
+
+    def __init__(
+        self,
+        dim: int,
+        swa: SlidingWindowAttention,
+        mlp_mult: float = 3.0,
+        mlp_act: str = "relu_sq",
+        layer_idx: int = 0,
+    ):
+        super().__init__()
+        self.attn_norm = RMSNorm(dim)
+        self.mlp_norm = RMSNorm(dim)
+        self.attn = swa
+        self.mlp = MLP(dim, mlp_mult, act=mlp_act)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.layer_idx = layer_idx
+
+    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x_in), v_embed=v_embed)
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out))
+        return x_out
+
+
+class SmearGate(nn.Module):
+    """Weighted average of current and previous token embeddings."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    """Hash-based bigram/trigram embedding for additional context."""
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int,
+                 trigram: bool = False):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self._trigram = trigram
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def trigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., :2] = mod
+        out[..., 2:] = (36313 * t[..., 2:] ^ 27191 * t[..., 1:-1] ^ 51497 * t[..., :-2]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self._trigram:
+            h = h + self.embed(self.trigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
+def _parse_layout(layout_str: str) -> list[tuple[str, int]]:
+    """Parse a layout string into a sequence of (layer_type, count) pairs.
+
+    Examples:
+        "gdn_only" -> [("gdn", 11)]  (count filled in by caller)
+        "gdn5_swa_gdn5_swa_shared" -> [("gdn", 5), ("swa", 1), ("gdn", 5), ("swa_shared", 1)]
+    """
+    if layout_str == "gdn_only":
+        return [("gdn", -1)]
+    if layout_str == "mamba_only":
+        return [("mamba", -1)]
+
+    parts = layout_str.split("_")
+    result = []
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if part.startswith("gdn") and len(part) > 3:
+            count = int(part[3:])
+            result.append(("gdn", count))
+        elif part.startswith("mamba") and len(part) > 5:
+            count = int(part[5:])
+            result.append(("mamba", count))
+        elif part == "swa":
+            if i + 1 < len(parts) and parts[i + 1] == "shared":
+                result.append(("swa_shared", 1))
+                i += 1
+            else:
+                result.append(("swa", 1))
+        elif part == "shared":
+            pass
+        i += 1
+    return result
+
+
+class HybridGDN(nn.Module):
+    """Hybrid GDN architecture supporting mixed recurrent/attention layers.
+
+    Builds a stack of blocks according to the layer_layout specification:
+    - "gdn" blocks use GatedDeltaNet (or GatedDeltaProduct)
+    - "mamba" blocks use Mamba-2
+    - "swa" blocks use SlidingWindowAttention
+    - "swa_shared" reuses the same SWA module (Griffin/Zamba-style weight sharing)
+
+    All models share: token embedding, bigram hash, smear gate, final norm, lm_head.
+    """
+    def __init__(self, config: dict, vocab_size: int = 1024):
+        super().__init__()
+        dim = config["model_dim"]
+        num_heads = config["num_heads"]
+        mlp_mult = config["mlp_mult"]
+        self.arch_name = config["arch_name"]
+        self.model_dim = dim
+        self.vocab_size = vocab_size
+        self.logit_softcap = 30.0
+
+        # Embeddings
+        self.tok_emb = nn.Embedding(vocab_size, dim)
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.005)
+        self.bigram = BigramHashEmbedding(
+            config.get("bigram_vocab_size", 2048),
+            config.get("bigram_dim", 128),
+            dim,
+            trigram=config.get("trigram", False),
+        )
+        self.smear = SmearGate(dim)
+
+        # Meta tokens (Hymba-style)
+        n_meta = config.get("meta_tokens", 0)
+        if n_meta > 0:
+            self.meta_tokens = nn.Parameter(torch.randn(1, n_meta, dim) * 0.02)
+            self.n_meta = n_meta
+        else:
+            self.meta_tokens = None
+            self.n_meta = 0
+
+        # Build layer stack
+        layout = _parse_layout(config["layer_layout"])
+        self.blocks = nn.ModuleList()
+        self._block_types = []
+        self._shared_swa = None
+
+        layer_idx = 0
+        for layer_type, count in layout:
+            if count == -1:
+                if layer_type == "gdn":
+                    count = config["num_gdn_layers"]
+                elif layer_type == "mamba":
+                    count = config["num_mamba_layers"]
+
+            for _ in range(count):
+                if layer_type == "gdn":
+                    recurrent = self._make_recurrent_layer(config, layer_idx)
+                    block = RecurrentBlock(dim, recurrent, mlp_mult, layer_idx=layer_idx)
+                    self.blocks.append(block)
+                    self._block_types.append("gdn")
+
+                elif layer_type == "mamba":
+                    mamba_expand = config.get("mamba_expand", 2)
+                    mamba_head_dim = config.get("gdn_head_dim", 64)
+                    mamba_num_heads = (dim * mamba_expand) // mamba_head_dim
+                    mamba = Mamba2(
+                        num_heads=mamba_num_heads,
+                        head_dim=mamba_head_dim,
+                        hidden_size=dim,
+                        state_size=config.get("mamba_state_size", 64),
+                        expand=mamba_expand,
+                        layer_idx=layer_idx,
+                    )
+                    block = RecurrentBlock(dim, mamba, mlp_mult, layer_idx=layer_idx)
+                    self.blocks.append(block)
+                    self._block_types.append("mamba")
+
+                elif layer_type in ("swa", "swa_shared"):
+                    if layer_type == "swa_shared" and self._shared_swa is not None:
+                        swa = self._shared_swa
+                    else:
+                        swa = SlidingWindowAttention(
+                            dim=dim,
+                            num_heads=num_heads,
+                            num_kv_heads=config.get("swa_num_kv_heads", 4),
+                            window_size=config.get("swa_window", 512),
+                            qk_gain_init=config.get("qk_gain_init", 1.5),  # Direction-5: 5.0
+                        )
+                        if config.get("swa_shared", False):
+                            self._shared_swa = swa
+
+                    block = AttentionBlock(dim, swa, mlp_mult, layer_idx=layer_idx)
+                    self.blocks.append(block)
+                    self._block_types.append("swa" if layer_type == "swa" else "swa_shared")
+
+                layer_idx += 1
+
+        self.final_norm = RMSNorm(dim)
+        self.lm_head = None  # tied to tok_emb
+        self._init_weights()
+
+    def _make_recurrent_layer(self, config: dict, layer_idx: int) -> nn.Module:
+        """Create the appropriate recurrent layer based on config."""
+        dim = config["model_dim"]
+        num_heads = config["num_heads"]
+
+        if config.get("use_rwkv7", False):
+            total_layers = config.get("num_gdn_layers", 11)
+            return RWKV7Attention(
+                hidden_size=dim,
+                head_dim=config.get("gdn_head_dim", 64),
+                num_heads=num_heads,
+                layer_idx=layer_idx,
+                num_hidden_layers=total_layers,
+                mode="chunk",
+            )
+        elif config.get("use_deltaproduct", False):
+            return GatedDeltaProduct(
+                hidden_size=dim,
+                head_dim=config.get("gdn_head_dim", 64),
+                num_heads=num_heads,
+                num_householder=config.get("dp_num_householder", 2),
+                allow_neg_eigval=config.get("dp_allow_neg_eigval", False),
+                use_short_conv=config.get("gdn_use_short_conv", True),
+                expand_v=config.get("gdn_expand_v", 1),
+                layer_idx=layer_idx,
+                mode="chunk",
+            )
+        else:
+            return GatedDeltaNet(
+                hidden_size=dim,
+                head_dim=config.get("gdn_head_dim", 64),
+                num_heads=num_heads,
+                allow_neg_eigval=config.get("gdn_allow_neg_eigval", False),
+                use_short_conv=config.get("gdn_use_short_conv", True),
+                expand_v=config.get("gdn_expand_v", 1),
+                layer_idx=layer_idx,
+                mode="chunk",
+            )
+
+    def _init_weights(self) -> None:
+        total_layers = len(self.blocks)
+        for name, p in self.named_parameters():
+            if ".recurrent." in name:
+                continue
+            if p.ndim == 2 and "proj" in name and "bigram" not in name:
+                with torch.no_grad():
+                    p.mul_(1.0 / math.sqrt(2 * total_layers))
+
+    def set_xsa(self, enable: bool = True) -> None:
+        """Enable/disable XSA on all attention blocks."""
+        for block, btype in zip(self.blocks, self._block_types):
+            if btype in ("swa", "swa_shared"):
+                block.attn.use_xsa = enable
+
+    def _compute_logits(self, x: Tensor) -> Tensor:
+        """Compute logits with tied embeddings and softcap."""
+        logits = F.linear(x, self.tok_emb.weight)
+        return self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+
+    def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
+        """Run all blocks on x with residual anchor x0."""
+        for block in self.blocks:
+            x = block(x, x0)
+        return x
+
+    def _embed(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
+        """Shared embedding + smear, returns (x, x0)."""
+        x = self.tok_emb(input_ids)
+        x = x + self.bigram(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = self.smear(x)
+        x0 = x
+        if self.meta_tokens is not None:
+            B = x.shape[0]
+            meta = self.meta_tokens.expand(B, -1, -1).to(dtype=x.dtype)
+            x = torch.cat([meta, x], dim=1)
+            x0 = torch.cat([meta, x0], dim=1)
+        return x, x0
+
+    def _strip_meta(self, x: Tensor) -> Tensor:
+        if self.meta_tokens is not None:
+            x = x[:, self.n_meta:]
+        return x
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        """Forward pass returning cross-entropy loss."""
+        x, x0 = self._embed(input_ids)
+        x = self._run_blocks(x, x0)
+        x = self._strip_meta(x)
+        x = self.final_norm(x)
+        logits = self._compute_logits(x.reshape(-1, x.size(-1)))
+        targets = target_ids.reshape(-1)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        """Forward pass returning softcapped logits (for evaluation)."""
+        x, x0 = self._embed(input_ids)
+        x = self._run_blocks(x, x0)
+        x = self._strip_meta(x)
+        x = self.final_norm(x)
+        return self._compute_logits(x)
+
+    def forward_hidden(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
+        """Forward pass returning (hidden_states, softcapped_logits) for RLS eval.
+
+        hidden_states: [B, T, dim] — final norm output before lm_head
+        softcapped_logits: [B, T, vocab] — softcap * tanh(linear / softcap)
+
+        Compliance note: called in inference_mode during eval.
+        The hidden states are purely causal (each h[t] depends only on x[0:t]).
+        """
+        x, x0 = self._embed(input_ids)
+        x = self._run_blocks(x, x0)
+        x = self._strip_meta(x)
+        x = self.final_norm(x)
+        logits = self._compute_logits(x)
+        return x, logits
+
+    def get_diagnostics(self) -> dict:
+        """Collect per-layer weight statistics for checkpoint diagnostics."""
+        diag = {}
+        for i, (block, btype) in enumerate(zip(self.blocks, self._block_types)):
+            prefix = f"layer_{i}_{btype}"
+            for name, param in block.named_parameters():
+                if param.ndim >= 2:
+                    w = param.data.float()
+                    diag[f"{prefix}/{name}/std"] = w.std().item()
+                    diag[f"{prefix}/{name}/kurtosis"] = (((w - w.mean()) / (w.std() + 1e-8)) ** 4).mean().item() - 3.0
+        return diag
+
+    def count_params(self) -> dict:
+        """Count parameters by category."""
+        cats = {"embedding": 0, "recurrent": 0, "attention": 0, "mlp": 0, "other": 0}
+        for name, p in self.named_parameters():
+            n = p.numel()
+            if "tok_emb" in name or "bigram" in name:
+                cats["embedding"] += n
+            elif any(k in name for k in ["recurrent", "gdn", "mamba", "rwkv", "delta"]):
+                cats["recurrent"] += n
+            elif "attn" in name or "c_q" in name or "c_k" in name or "c_v" in name:
+                cats["attention"] += n
+            elif "mlp" in name or "fc" in name:
+                cats["mlp"] += n
+            else:
+                cats["other"] += n
+        cats["total"] = sum(cats.values())
+        return cats

@@ -1,5 +1,137 @@
-import base64, lzma, linecache
-globals()['__file__'] = 'configs.py'
-_src = lzma.decompress(base64.b85decode(b'{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;1K==%Uu8wXb(;1LpQ-~@JH;7bq<!2rM>sfvNj2i-6-~M*R0t23rwIc7?+`^!VD6uagcoK6DbS{9T~420xAWik!$biWb)rrE+C-SGfkiwhV0~r&>A7MzvaxD&2QbJ{2wIdK)(s%&mtZ-@C^j&Il;>(HV9Kdzl26iSpQ@}+W8F+gFd4uyfywfyMFM`tZ6yPk2@}Bf`F{`G|QqY_~SLO)^$j(lVw5|@~26gr#@Cy$?g#DNu)(MZ3zM3D848h-pG^4;H!1seE8;!)*!vr<*hh_M)n_J*FkAv3&y+~EaG*xEwZ(y0{Dluk1)M?vK|<?M15&9sh9@)sm=9EQ!l9<F=3hI{V_#FZb(VhKFRJTCvj$idas@TZXBNDLU;Z*-1PC|^dt;z;sGN1$)2AK@%4k~y7Ij08HFB(E_tT8(BIU{1VYBaM8e3);f(C<O!9w?`>r-z=2q;$f?Np>RAmtd0SnvDX9u|NdpKRv1XCu)-hRaPhu(+3vIVgK=%?W`h<nrj@^ClP57G3H$Ka_p0^Lhhy){F)Rzt1mZ4=&&wEnHFK4UVYgugE;)jv{i-?&ldyTBS(mqu&f5X^|fs%L$&s&;0h<_JOdpj5J4B-WfP{dfC9+{^sg^v5;>*Ir!o`XM-gyZHpY(;A=WQ%uIy-LEpk?32}<@uwZHb{=xO>@YgZg&n)w-2CzKB!f!PX4{sbfc`i@s;=Z)Js>=-iM6SYI+Q(`U`M<IVh8XMFDd+B`sqIQM5;%)xR;J+D72uYc+Iz<mDBMb+;NowsU><Q-aeFf6J}m)nODlO?Mv84+2(r)&&4T&86TFCk=yXWPs~%Vy-LioO;Yd>gV{}<wkto7{`3JW|8UjLBhjgROZzy&cg`aRWW%}9i{#DRsIpaD9_Va<3?@d{W`OB1T5`_6m`oCMDbS3M7BzqM<WQX(Nvd|X!atM(ztWo!P$;vfz$#P<5xGfqqg7;Yr-so}n=-sgRPRsFA9Fl0F%Pb@36LC1gv#~HAKY1Ml^jurbyw~$C$RHK^VlPtr!MLXq3wTKOCFZ_P3-79YWYpaCz_BWcE_YNptPThG8=ZVmwW2lGk<RbZgtH|@~c!AI7~_|56dJYhXhj_=hL<YLZz{c3mGo}L36^tMzj=fJx_u*k6!31n!ByTnf?<Me-7elw4W;X!EBx6Cs~oZ(X}TztV4Z82EEqhG0{8x{QBoG9kwpH*|JMc$m8jCmaz7f5-J%nY(HgqSIzgomvEiNbsB~$Tk@6G8mHWLI=%U?eAy?aPo6mX!x#wD74cjcK>Z-mMs{`4u_n2wsGC14_Pi&1O3GbJ82-<=%ePMG6(KXaL$5W57RMv}0_vMs`@UkDBTH-R%ko})Yg?AOCht_=5RD#cvY2)jQ&tE*`7?1>pJTzY%sLiRkLAqYJr0qyGdhd~uy@0D5xG=3C?waVq~$|Q#!<?>JCX&-oh{sufJ>q}>z-_UbAeQ3l;2VRB$MCD-_NXhRZ#7v%p&MFs!t`_Y$`GiU4-YOmqjOJm$ZOflTGRdW}mWmDGGLnOW%_=;rSv3Gm$hgn<~9@hs)#-g{3+d;Vo~}ax{{l%l=VDe2Bo^B8Lcu<75bM-hIE)J8?E}g2~HGoyh5%fYjL46`UGK$i-9Ta^wXSK-7bJn%)z#XM+i(MFA#)^J?TaE?@kIZ=V4zfp$|^j3BuWKRuaz*OmfluO>S6^XY2?e9Z3q2+1CVv*C!s#1PtU@V=DVxEFsS>8lv-tc~<X(o7~cC62?Guo8WU2W#K{m_c%|lavV8mW;Tmc+d*b>n;l5Q+cxVMb98Ou7vHP5Xf53+_dNGNVPzcF-5<Y@s`%l@sGT&_6tnrf2ac(0YTLqkxs8D|5jppc#LkSCX%PAd`v&<7r1YYXy}Hg@^(PC)Kz<^CrSVSBK&Om4$c`m00HL<{~-VX(Bw{7vBYQl0ssI200dcD')).decode()
-linecache.cache['configs.py'] = (len(_src), None, _src.splitlines(True), 'configs.py')
-exec(compile(_src, 'configs.py', 'exec'))
+"""Model architecture configurations for Direction-5 (GDN-Hybrid + RLS).
+
+Model D is our primary target:
+  GDN×5 → shared SWA → GDN×5 → shared SWA (Griffin-style)
+  dim=512, qk_gain_init=5.0, bigram 3072×112 + trigram
+
+Model J (Phase 4 if needed):
+  12-layer GDN, dim=480, KV-sharing stride=2 (GDN-native depth recurrence)
+
+All models sized to fit ~16MB at int6+zstd-22.
+"""
+from __future__ import annotations
+
+
+def model_a_pure_gdn() -> dict:
+    """Model A: Pure GDN (Baseline) — 10 layers Gated DeltaNet."""
+    return dict(
+        arch_name="A_PureGDN",
+        num_gdn_layers=10,
+        num_mamba_layers=0,
+        num_swa_layers=0,
+        swa_shared=False,
+        model_dim=512,
+        num_heads=8,
+        mlp_mult=3.0,
+        gdn_expand_v=1,
+        gdn_head_dim=64,
+        gdn_allow_neg_eigval=False,
+        gdn_use_short_conv=True,
+        swa_window=512,
+        swa_num_kv_heads=4,
+        qk_gain_init=1.5,
+        meta_tokens=0,
+        layer_layout="gdn_only",
+        bigram_vocab_size=3072,
+        bigram_dim=112,
+        trigram=True,
+    )
+
+
+def model_d_gdn_hybrid() -> dict:
+    """Model D: GDN + Shared SWA — our Direction-5 primary target.
+
+    Architecture: [GDN×5] → [SWA] → [GDN×5] → [SWA_shared]
+    This is Griffin-style: interleaved recurrent + local attention with weight sharing.
+
+    Key changes vs PR #1370 Model D:
+    - qk_gain_init=5.0 (stronger initial attention, following competition SOTA)
+    - bigram_vocab_size=3072, bigram_dim=112, trigram=True (matches Model A best setting)
+    - swa_window=512 (standard; can increase for Phase 4)
+    """
+    return dict(
+        arch_name="D_GDN_Hybrid",
+        num_gdn_layers=10,
+        num_mamba_layers=0,
+        num_swa_layers=1,
+        swa_shared=True,
+        model_dim=512,
+        num_heads=8,
+        mlp_mult=3.0,
+        gdn_expand_v=1,
+        gdn_head_dim=64,
+        gdn_allow_neg_eigval=False,
+        gdn_use_short_conv=True,
+        swa_window=512,
+        swa_num_kv_heads=4,
+        qk_gain_init=5.0,          # Direction-5: strong initial attention gain
+        meta_tokens=0,
+        # Layout: [GDN×5] → [SWA] → [GDN×5] → [SWA_shared]
+        layer_layout="gdn5_swa_gdn5_swa_shared",
+        bigram_vocab_size=3072,    # Direction-5: full bigram table (vs 2048 default)
+        bigram_dim=112,            # Direction-5: matches Model A best setting
+        trigram=True,              # Direction-5: add trigram for extra context
+    )
+
+
+def model_d_smoke() -> dict:
+    """Model D Smoke: Same architecture, smaller for CPU sanity checks."""
+    cfg = model_d_gdn_hybrid()
+    cfg["arch_name"] = "D_Smoke"
+    cfg["model_dim"] = 128
+    cfg["num_heads"] = 4
+    cfg["gdn_head_dim"] = 32
+    cfg["swa_num_kv_heads"] = 2
+    cfg["bigram_vocab_size"] = 512
+    cfg["bigram_dim"] = 64
+    return cfg
+
+
+def model_j_kv_share() -> dict:
+    """Model J: 12-layer GDN + KV-sharing (Phase 4 depth ablation).
+
+    GDN-native equivalent of transformer depth recurrence.
+    Adjacent GDN layer pairs share K/V projections, freeing ~528K params per pair.
+    Those params → more layers (12 vs 10) at narrower dim (480 vs 512).
+
+    Note: KV-sharing in GDN requires architectures.py to support it.
+    This config is defined here for planning; implement in Phase 4 if needed.
+    """
+    return dict(
+        arch_name="J_GDN_KVShare",
+        num_gdn_layers=12,
+        num_mamba_layers=0,
+        num_swa_layers=0,
+        swa_shared=False,
+        model_dim=480,
+        num_heads=8,
+        mlp_mult=3.0,
+        gdn_expand_v=1,
+        gdn_head_dim=60,
+        gdn_allow_neg_eigval=False,
+        gdn_use_short_conv=True,
+        swa_window=512,
+        swa_num_kv_heads=4,
+        qk_gain_init=1.5,
+        meta_tokens=0,
+        layer_layout="gdn_only",
+        bigram_vocab_size=3072,
+        bigram_dim=112,
+        trigram=True,
+        kv_share_stride=2,  # share K/V every 2 GDN layers (not yet implemented)
+    )
+
+
+ALL_CONFIGS = {
+    "A": model_a_pure_gdn,
+    "D": model_d_gdn_hybrid,
+    "D_smoke": model_d_smoke,
+    "J": model_j_kv_share,
+}
+
+
+def get_config(model_id: str) -> dict:
+    """Get config by model ID (A, D, D_smoke, J)."""
+    if model_id not in ALL_CONFIGS:
+        raise ValueError(f"Unknown model ID '{model_id}'. Choose from {list(ALL_CONFIGS.keys())}")
+    return ALL_CONFIGS[model_id]()
