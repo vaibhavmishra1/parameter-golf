@@ -132,15 +132,17 @@ class Hyperparameters:
     # Direction-5: QK gain override (set in config; this overrides config value if set)
     qk_gain_init_override = os.environ.get("QK_GAIN_INIT", "")
 
-    # Legal TTT (score-first, chunk-based SGD)
+    # Legal TTT v2 (document-independent, AdamW, weight souping)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.001))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
-    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.0008))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 5))
-    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_wd = float(os.environ.get("TTT_WD", 0.01))
+    ttt_soup_alpha = float(os.environ.get("TTT_SOUP_ALPHA", 0.3))
+    ttt_min_doc_tokens = int(os.environ.get("TTT_MIN_DOC_TOKENS", 256))
+    ttt_bos_id = int(os.environ.get("TTT_BOS_ID", 1))
 
 
 # ─── Data Loading ─────────────────────────────────────────────────────────────
@@ -403,163 +405,220 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
-# ─── Legal TTT (Score-First, Chunk-Based SGD) ────────────────────────────────
+# ─── Legal TTT v2 (Document-Independent, AdamW, Weight Souping) ──────────────
 
-def eval_val_sliding_ttt(
+def _find_documents(all_tokens: Tensor, bos_id: int, min_tokens: int = 256) -> list[tuple[int, int]]:
+    """Find document boundaries by BOS token positions.
+    Returns list of (start, length) for each document with >= min_tokens."""
+    bos_positions = (all_tokens == bos_id).nonzero(as_tuple=True)[0].tolist()
+    docs = []
+    for i in range(len(bos_positions)):
+        start = bos_positions[i]
+        end = bos_positions[i + 1] if i + 1 < len(bos_positions) else all_tokens.numel()
+        length = end - start
+        if length >= min_tokens:
+            docs.append((start, length))
+    return docs
+
+
+def eval_val_ttt_v2(
     args, base_model: nn.Module, rank: int, world_size: int,
     device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
-    stride: int, batch_seqs: int = 32, log0=print,
+    stride: int, log0=print,
 ) -> tuple[float, float]:
-    """Legal score-first TTT: score each chunk with sliding windows,
-    then train on it. Every token scored BEFORE any update that could use it."""
+    """Legal document-independent TTT v2.
+
+    For each document:
+      1. Reset model to original EMA weights
+      2. Process document in chunks:
+         a. SCORE chunk (inference_mode) — accumulate BPB
+         b. TRAIN on chunk (AdamW) — adapt to this document
+      3. After all chunks: soup adapted weights back into original
+
+    No cross-document information leakage. Each token scored BEFORE any
+    update that uses it. Weight souping blends per-document adaptations
+    into the base model for downstream quantization.
+    """
     seq_len = args.eval_seq_len
     total_tokens = val_tokens.numel() - 1
-    ttt_chunk = args.ttt_chunk_tokens
+    soup_alpha = args.ttt_soup_alpha
 
-    # Pre-compute all window starts
-    window_starts = [ws for ws in range(0, total_tokens, stride)
-                     if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
+    # Find documents
+    docs = _find_documents(val_tokens, args.ttt_bos_id, args.ttt_min_doc_tokens)
+    log0(f"ttt_v2:found {len(docs)} documents (min_tokens={args.ttt_min_doc_tokens})")
 
-    # Assign each window to a chunk based on the first token it scores
-    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
-    chunk_windows: list[list[int]] = [[] for _ in range(num_chunks)]
-    for ws in window_starts:
-        end = min(ws + seq_len, total_tokens)
-        wlen = end - ws
-        s = 0 if ws == 0 else max(wlen - stride, 0)
-        scored_start = ws + s
-        ci = min(scored_start // ttt_chunk, num_chunks - 1)
-        chunk_windows[ci].append(ws)
+    if len(docs) == 0:
+        log0("ttt_v2:no documents found, falling back to single-document mode")
+        docs = [(0, total_tokens + 1)]
 
-    log0(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
-         f"total_windows={len(window_starts)} stride={stride} "
-         f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
-         f"freeze_blocks={args.ttt_freeze_blocks}")
+    # Save original EMA weights (pristine checkpoint)
+    original_sd = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
 
+    # Determine trainable params (freeze first N blocks)
+    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
+
+    def _get_ttt_params():
+        params = []
+        for name, p in base_model.named_parameters():
+            freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
+            if freeze:
+                p.requires_grad_(False)
+            else:
+                p.requires_grad_(True)
+                params.append(p)
+        return params
+
+    ttt_params = _get_ttt_params()
+    log0(f"ttt_v2:params unfrozen={sum(p.numel() for p in ttt_params)} "
+         f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
+    log0(f"ttt_v2:config lr={args.ttt_lr} epochs={args.ttt_epochs} "
+         f"wd={args.ttt_wd} soup_alpha={soup_alpha} freeze_blocks={args.ttt_freeze_blocks}")
+
+    # Accumulators for BPB
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    # Freeze first N blocks
-    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
-    ttt_params = []
-    for name, p in base_model.named_parameters():
-        freeze = False
-        for bi in frozen_block_ids:
-            if f"blocks.{bi}." in name:
-                freeze = True
-                break
-        if freeze:
-            p.requires_grad_(False)
-        else:
-            p.requires_grad_(True)
-            ttt_params.append(p)
+    # Weight soup accumulator (running weighted average of adapted weights)
+    soup_state = {k: torch.zeros_like(v, dtype=torch.float64, device='cpu')
+                  for k, v in original_sd.items()}
+    soup_doc_count = 0
 
-    log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
-         f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
-
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
     t0 = time.perf_counter()
 
-    for ci in range(num_chunks):
-        windows = chunk_windows[ci]
-        if not windows:
-            continue
-        chunk_start = ci * ttt_chunk
-        chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
+    # Distribute documents across ranks
+    my_doc_s = (len(docs) * rank) // world_size
+    my_doc_e = (len(docs) * (rank + 1)) // world_size
+    my_docs = docs[my_doc_s:my_doc_e]
 
-        # --- Phase 1: SCORE this chunk's windows (inference_mode) ---
-        my_s = (len(windows) * rank) // world_size
-        my_e = (len(windows) * (rank + 1)) // world_size
-        my_windows = windows[my_s:my_e]
+    for di, (doc_start, doc_len) in enumerate(my_docs):
+        # --- Reset to original weights ---
+        base_model.load_state_dict(original_sd, strict=True)
+        ttt_params = _get_ttt_params()
 
-        base_model.eval()
-        with torch.inference_mode():
-            for bi in range(0, len(my_windows), batch_seqs):
-                batch_ws = my_windows[bi:bi + batch_seqs]
-                bsz = len(batch_ws)
-                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-                wlens: list[int] = []
-                for i, ws in enumerate(batch_ws):
-                    end = min(ws + seq_len, total_tokens)
-                    wlen = end - ws
-                    wlens.append(wlen)
-                    chunk_tok = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
-                    x_batch[i, :wlen] = chunk_tok[:-1]
-                    y_batch[i, :wlen] = chunk_tok[1:]
+        # Build optimizer fresh for each document
+        optimizer = torch.optim.AdamW(
+            ttt_params, lr=args.ttt_lr,
+            betas=(0.9, 0.999), eps=1e-8,
+            weight_decay=args.ttt_wd, fused=True,
+        )
+
+        # Split document into chunks
+        pred_len = doc_len - 1  # number of prediction positions
+        chunk_size = seq_len  # one chunk = one sequence length
+        num_chunks = max(1, (pred_len + chunk_size - 1) // chunk_size)
+
+        for ci in range(num_chunks):
+            chunk_start_in_doc = ci * chunk_size
+            chunk_end_in_doc = min((ci + 1) * chunk_size, pred_len)
+            chunk_len = chunk_end_in_doc - chunk_start_in_doc
+            if chunk_len <= 0:
+                continue
+
+            # Use context window: look back up to seq_len tokens
+            win_end = doc_start + chunk_end_in_doc + 1  # +1 for target
+            win_start = max(doc_start, win_end - seq_len - 1)
+            win_tokens = val_tokens[win_start:win_end].to(dtype=torch.int64, device=device)
+            wlen = win_tokens.numel() - 1
+
+            x = win_tokens[:-1].unsqueeze(0)  # [1, wlen]
+            y = win_tokens[1:].unsqueeze(0)    # [1, wlen]
+
+            # --- Phase 1: SCORE this chunk (inference_mode) ---
+            base_model.eval()
+            with torch.inference_mode():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = base_model.forward_logits(x_batch)
+                    logits = base_model.forward_logits(x)
                 nll = F.cross_entropy(
                     logits.reshape(-1, logits.size(-1)).float(),
-                    y_batch.reshape(-1), reduction="none",
-                ).reshape(bsz, seq_len)
-                for i, ws in enumerate(batch_ws):
-                    wlen = wlens[i]
-                    s = 0 if ws == 0 else max(wlen - stride, 0)
-                    scored_nll = nll[i, s:wlen].to(torch.float64)
-                    loss_sum += scored_nll.sum()
-                    token_count += float(wlen - s)
-                    tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
-                    tb = base_bytes_lut[tgt].to(torch.float64)
-                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                    byte_count += tb.sum()
+                    y.reshape(-1), reduction="none",
+                )  # [wlen]
 
-        # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
-        is_last_chunk = (ci == num_chunks - 1)
-        if not is_last_chunk and args.ttt_epochs > 0:
-            base_model.train()
-            chunk_seqs = (chunk_end - chunk_start) // seq_len
-            if chunk_seqs > 0:
-                cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                for pg in optimizer.param_groups:
-                    pg['lr'] = cos_lr
-                my_seq_s = (chunk_seqs * rank) // world_size
-                my_seq_e = (chunk_seqs * (rank + 1)) // world_size
-                my_chunk_seqs = my_seq_e - my_seq_s
+                # Only score the NEW tokens in this chunk (not context from previous chunks)
+                context_offset = wlen - chunk_len
+                scored_nll = nll[context_offset:].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(chunk_len)
+
+                tgt = y[0, context_offset:]
+                prev = x[0, context_offset:]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+
+            # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
+            is_last_chunk = (ci == num_chunks - 1)
+            if not is_last_chunk and args.ttt_epochs > 0:
+                base_model.train()
                 for _ep in range(args.ttt_epochs):
-                    for bs in range(0, my_chunk_seqs, args.ttt_batch_seqs):
-                        be = min(bs + args.ttt_batch_seqs, my_chunk_seqs)
-                        actual_bs = my_seq_s + bs
-                        start_tok = chunk_start + actual_bs * seq_len
-                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                        if end_tok > val_tokens.numel():
-                            continue
-                        local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
-                        x = local[:-1].reshape(-1, seq_len)
-                        y = local[1:].reshape(-1, seq_len)
-                        optimizer.zero_grad(set_to_none=True)
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            loss = base_model(x, y)
-                        loss.backward()
-                        if world_size > 1:
-                            for p in ttt_params:
-                                if p.grad is not None:
-                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                        torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
-                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        loss = base_model(x, y)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
+                    optimizer.step()
 
-        if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
+        # --- After document: accumulate adapted weights for souping ---
+        with torch.no_grad():
+            for k, v in base_model.state_dict().items():
+                soup_state[k] += v.detach().cpu().double()
+        soup_doc_count += 1
+
+        # Progress logging
+        if rank == 0 and (di % 50 == 0 or di == len(my_docs) - 1):
             elapsed = time.perf_counter() - t0
-            rl = loss_sum.item() / max(token_count.item(), 1)
-            rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            log0(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+            tc = token_count.item()
+            if tc > 0:
+                rl = loss_sum.item() / tc
+                rbpb = rl / math.log(2.0) * (tc / max(byte_count.item(), 1))
+            else:
+                rbpb = 0.0
+            log0(f"  ttt_doc [{di+1}/{len(my_docs)}] bpb={rbpb:.6f} "
+                 f"docs_done={soup_doc_count} time={elapsed:.1f}s")
 
+    # --- All-reduce across ranks ---
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
 
+        # Reduce soup weights across ranks
+        total_doc_count_t = torch.tensor([soup_doc_count], dtype=torch.int64, device=device)
+        dist.all_reduce(total_doc_count_t, op=dist.ReduceOp.SUM)
+        total_doc_count = total_doc_count_t.item()
+
+        for k in soup_state:
+            soup_t = soup_state[k].to(device)
+            dist.all_reduce(soup_t, op=dist.ReduceOp.SUM)
+            soup_state[k] = soup_t.cpu()
+    else:
+        total_doc_count = soup_doc_count
+
     val_loss = (loss_sum / token_count).item()
     val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+
+    # --- Weight souping: blend adapted average with original ---
+    if total_doc_count > 0 and soup_alpha > 0:
+        soup_avg = {k: v / total_doc_count for k, v in soup_state.items()}
+        souped_sd = {}
+        for k in original_sd:
+            orig = original_sd[k].double()
+            adapted = soup_avg[k].to(orig.device).double()
+            souped = (1.0 - soup_alpha) * orig + soup_alpha * adapted
+            souped_sd[k] = souped.to(original_sd[k].dtype)
+        base_model.load_state_dict(souped_sd, strict=True)
+        log0(f"ttt_v2:soup applied alpha={soup_alpha} from {total_doc_count} documents")
+    else:
+        base_model.load_state_dict(original_sd, strict=True)
+        log0("ttt_v2:no souping (restored original weights)")
 
     # Restore all params to trainable
     for p in base_model.parameters():
         p.requires_grad_(True)
     base_model.eval()
 
-    log0(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
+    log0(f"ttt_v2:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
          f"elapsed={time.perf_counter() - t0:.1f}s")
     return val_loss, val_bpb
 
@@ -1232,16 +1291,13 @@ def main():
         torch.save(base_model.state_dict(), os.path.join(args.ckpt_dir, f"final_model_{config['arch_name']}_seed{args.seed}.pt"))
         log0("Saved raw EMA model")
 
-    # ─── Legal TTT (score-first, chunk-based SGD) ────────────────────────
+    # ─── Legal TTT v2 (document-independent, AdamW, weight souping) ────
     if args.ttt_enabled:
-        log0(f"\n=== Legal TTT: score-first chunk SGD ===")
-        log0(f"TTT config: lr={args.ttt_lr} epochs={args.ttt_epochs} "
-             f"chunk={args.ttt_chunk_tokens} freeze={args.ttt_freeze_blocks} "
-             f"momentum={args.ttt_momentum}")
-        ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+        log0(f"\n=== Legal TTT v2: document-independent AdamW + weight soup ===")
+        ttt_loss, ttt_bpb = eval_val_ttt_v2(
             args, base_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, batch_seqs=args.ttt_batch_seqs, log0=log0,
+            stride=args.eval_stride, log0=log0,
         )
         log0(f"Post-TTT BPB: {ttt_bpb:.6f}")
 
