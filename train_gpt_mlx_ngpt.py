@@ -399,9 +399,14 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
 
-        # auto alpha: 1/num_layers if not specified
+        # Correct alpha: the paper's 1/num_layers assumes unit-norm sublayer outputs.
+        # We don't normalize z before tangent projection (keeps zero-init proj clean:
+        # z≈0 → no amplified noise → true identity at init).
+        # ||RMSNorm(x)|| = sqrt(dim), so ||z|| ≈ sqrt(dim) after linear layers.
+        # Effective sphere step = alpha * ||z|| ≈ alpha * sqrt(dim).
+        # Target step = 1/num_layers → alpha = 1 / (num_layers * sqrt(dim)).
         if ngpt_alpha_init <= 0.0:
-            ngpt_alpha_init = 1.0 / max(num_layers, 1)
+            ngpt_alpha_init = 1.0 / (max(num_layers, 1) * math.sqrt(dim))
         # auto logit temperature: sqrt(dim) if not specified
         if ngpt_logit_temp_init <= 0.0:
             ngpt_logit_temp_init = math.sqrt(dim)

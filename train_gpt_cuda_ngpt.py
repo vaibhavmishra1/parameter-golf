@@ -483,8 +483,14 @@ class DistributedTokenLoader:
 # -----------------------------
 
 def unit_norm(x: Tensor, eps: float = 1e-8) -> Tensor:
-    """Normalize to unit L2 norm along the last dimension."""
-    return x / (x.norm(dim=-1, keepdim=True) + eps)
+    """Normalize to unit L2 norm along the last dimension.
+
+    Norm is computed in float32 for stability (bfloat16 accumulates 512 squared
+    values with only 7 mantissa bits, causing norm underestimation), then the
+    result is cast back to the original dtype.
+    """
+    norm = x.float().norm(dim=-1, keepdim=True).clamp_min(eps)
+    return (x / norm.to(x.dtype))
 
 
 def _row_normalize(w: Tensor, eps: float = 1e-8) -> Tensor:
@@ -497,8 +503,12 @@ def _tangent_project(h: Tensor, z: Tensor) -> Tensor:
 
     Strips the component of z pointing along h so the update moves
     along the sphere surface rather than radially:  z - h * <h, z>
+
+    Dot product is computed in float32: bfloat16 has 7 mantissa bits, so
+    accumulating 512 pairwise products of ~1/sqrt(512) ≈ 0.044 elements
+    loses precision on the cosine similarity values we need to subtract.
     """
-    dot = (h * z).sum(dim=-1, keepdim=True)
+    dot = (h.float() * z.float()).sum(dim=-1, keepdim=True).to(h.dtype)
     return z - h * dot
 
 
@@ -707,9 +717,16 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
 
-        # Auto-initialize alpha and logit temperature
+        # Auto-initialize alpha and logit temperature.
         if ngpt_alpha_init <= 0.0:
-            ngpt_alpha_init = 1.0 / max(num_layers, 1)
+            # The nGPT paper sets alpha = 1/num_layers assuming sublayer outputs z are unit-norm
+            # before the tangent projection. We do NOT normalize z first (keeps zero-init of proj
+            # clean: z≈0 → no noisy unit-norm direction → true identity at init).
+            # With unnormalized z, the RMSNorm input has ||RMSNorm(x)||=sqrt(d)≈22.6, and
+            # after linear layers ||z||≈sqrt(d). So the effective sphere step is:
+            #   alpha * ||z|| ≈ alpha * sqrt(d)
+            # Target step size 1/num_layers → alpha = 1 / (num_layers * sqrt(model_dim))
+            ngpt_alpha_init = 1.0 / (max(num_layers, 1) * math.sqrt(model_dim))
         if ngpt_logit_temp_init <= 0.0:
             ngpt_logit_temp_init = math.sqrt(model_dim)
         self.ngpt_alpha_init = ngpt_alpha_init
@@ -741,8 +758,12 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        # Unit-normalize initial embedding (place tokens on the hypersphere)
-        x = unit_norm(self.tok_emb(input_ids).float()).to(input_ids.device)
+        # Unit-normalize initial embedding (place tokens on the hypersphere).
+        # Do NOT cast to float32 here — that would force the entire residual stream into
+        # float32, bypassing bfloat16 autocast and costing ~3x throughput on H100.
+        # unit_norm() internally uses float32 only for the norm computation (precision),
+        # then casts back to the embedding weight's dtype (bfloat16).
+        x = unit_norm(self.tok_emb(input_ids))
         x0 = x
         skips: list[Tensor] = []
 
