@@ -678,17 +678,32 @@ class Block(nn.Module):
         # U-Net anchor blend (same as baseline)
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
+    @staticmethod
+    def _clamp_sublayer(z: Tensor) -> Tensor:
+        """Soft-clamp sublayer output to unit sphere.
+
+        Divides by max(||z||, 1.0) along the last dim:
+          - ||z|| < 1: keeps z as-is (small updates early in training; zero-init proj → z≈0)
+          - ||z|| ≥ 1: normalizes to unit sphere (bounds sphere step to ≤ alpha)
+
+        Without this, ||z|| ≈ sqrt(dim) ≈ 22.6 → sphere step = alpha * 22.6 ≈ 2.5 per block
+        → 68-degree rotation per block → 0.01% of x0 survives 9 blocks (catastrophic).
+        With clamping: sphere step ≤ alpha = 1/num_layers → 6.3-degree rotation → 94.6% survives.
+        """
+        norm = z.float().norm(dim=-1, keepdim=True).clamp_min(1.0)
+        return (z / norm.to(z.dtype))
+
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         # Blend current and initial hidden state, then re-normalize to sphere
         mix = self.resid_mix.to(dtype=x.dtype)
         x = unit_norm(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
 
-        # Attention: tangent-plane update
-        z_attn = self.attn(self.attn_norm(x))
+        # Attention: tangent-plane update. Soft-clamp z so ||z|| ≤ 1 before projection.
+        z_attn = self._clamp_sublayer(self.attn(self.attn_norm(x)))
         x = unit_norm(x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * _tangent_project(x, z_attn))
 
-        # MLP: tangent-plane update
-        z_mlp = self.mlp(self.mlp_norm(x))
+        # MLP: tangent-plane update. Soft-clamp z so ||z|| ≤ 1 before projection.
+        z_mlp = self._clamp_sublayer(self.mlp(self.mlp_norm(x)))
         x = unit_norm(x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * _tangent_project(x, z_mlp))
         return x
 
@@ -719,14 +734,9 @@ class GPT(nn.Module):
 
         # Auto-initialize alpha and logit temperature.
         if ngpt_alpha_init <= 0.0:
-            # The nGPT paper sets alpha = 1/num_layers assuming sublayer outputs z are unit-norm
-            # before the tangent projection. We do NOT normalize z first (keeps zero-init of proj
-            # clean: z≈0 → no noisy unit-norm direction → true identity at init).
-            # With unnormalized z, the RMSNorm input has ||RMSNorm(x)||=sqrt(d)≈22.6, and
-            # after linear layers ||z||≈sqrt(d). So the effective sphere step is:
-            #   alpha * ||z|| ≈ alpha * sqrt(d)
-            # Target step size 1/num_layers → alpha = 1 / (num_layers * sqrt(model_dim))
-            ngpt_alpha_init = 1.0 / (max(num_layers, 1) * math.sqrt(model_dim))
+            # Paper value: 1/num_layers. This is correct when sublayer outputs z are
+            # soft-clamped to ||z|| ≤ 1 before the tangent projection (see Block.forward).
+            ngpt_alpha_init = 1.0 / max(num_layers, 1)
         if ngpt_logit_temp_init <= 0.0:
             ngpt_logit_temp_init = math.sqrt(model_dim)
         self.ngpt_alpha_init = ngpt_alpha_init
