@@ -71,9 +71,7 @@ class Hyperparameters():
     loop_start = int(os.environ.get('LOOP_START', 4))
     loop_end = int(os.environ.get('LOOP_END', 5))
     enable_looping_at = float(os.environ.get('ENABLE_LOOPING_AT', 0.5))
-    hyperloop_enabled = bool(int(os.environ.get('HYPERLOOP_ENABLED', '1')))
-    hyperloop_streams = int(os.environ.get('HYPERLOOP_STREAMS', 4))
-    hyperloop_start_frac = float(os.environ.get('HYPERLOOP_START_FRAC', 0.0))
+    loop_pos_emb_enabled = bool(int(os.environ.get('LOOP_POS_EMB_ENABLED', '1')))
 
     # Optimizer
     min_lr = float(os.environ.get('MIN_LR', 0.0))
@@ -457,54 +455,6 @@ class Block(nn.Module):
         return x_out
 
 
-class HyperloopConnection(nn.Module):
-    def __init__(self, dim: int, streams: int, num_loop_iters: int):
-        super().__init__()
-        if streams <= 1:
-            raise ValueError(f"hyperloop_streams must be greater than 1, got {streams}")
-        if num_loop_iters <= 0:
-            raise ValueError(f"num_loop_iters must be positive, got {num_loop_iters}")
-        self.dim = dim
-        self.streams = streams
-        self.num_loop_iters = num_loop_iters
-        width = streams * dim
-        self.pre = nn.ModuleList([CastedLinear(width, streams, bias=False) for _ in range(num_loop_iters)])
-        self.post = nn.ModuleList([CastedLinear(width, streams, bias=False) for _ in range(num_loop_iters)])
-        self.res = nn.ModuleList([CastedLinear(width, streams, bias=False) for _ in range(num_loop_iters)])
-        self.pre_bias = nn.Parameter(torch.empty(num_loop_iters, streams, dtype=torch.float32))
-        self.post_bias = nn.Parameter(torch.empty(num_loop_iters, streams, dtype=torch.float32))
-        self.res_bias = nn.Parameter(torch.empty(num_loop_iters, streams, dtype=torch.float32))
-        self.pre_alpha = nn.Parameter(torch.ones(num_loop_iters, dtype=torch.float32))
-        self.post_alpha = nn.Parameter(torch.ones(num_loop_iters, dtype=torch.float32))
-        self.res_alpha = nn.Parameter(torch.ones(num_loop_iters, dtype=torch.float32))
-        self.loop_pos_emb = nn.Parameter(torch.zeros(num_loop_iters, dim, dtype=torch.float32))
-
-        pre_bias = math.log((1.0 / streams) / (1.0 - 1.0 / streams))
-        for pre, post, res in zip(self.pre, self.post, self.res):
-            pre._zero_init = True
-            post._zero_init = True
-            res._zero_init = True
-        nn.init.constant_(self.pre_bias, pre_bias)
-        nn.init.zeros_(self.post_bias)
-        nn.init.constant_(self.res_bias, -8.0)
-
-    def gates(self, streams: Tensor, loop_idx: int) -> tuple[Tensor, Tensor, Tensor]:
-        z = F.rms_norm(streams.flatten(2), (self.streams * self.dim,))
-        pre = torch.sigmoid(
-            self.pre_alpha[loop_idx].to(dtype=z.dtype) * self.pre[loop_idx](z)
-            + self.pre_bias[loop_idx].to(dtype=z.dtype)
-        )
-        post = 2.0 * torch.sigmoid(
-            self.post_alpha[loop_idx].to(dtype=z.dtype) * self.post[loop_idx](z)
-            + self.post_bias[loop_idx].to(dtype=z.dtype)
-        )
-        res = torch.sigmoid(
-            self.res_alpha[loop_idx].to(dtype=z.dtype) * self.res[loop_idx](z)
-            + self.res_bias[loop_idx].to(dtype=z.dtype)
-        )
-        return pre, post, res
-
-
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
         super().__init__()
@@ -542,18 +492,13 @@ class GPT(nn.Module):
 
         # Layer looping
         self.looping_active: bool = False
-        self.hyperloop_enabled = h.hyperloop_enabled and h.num_loops > 0
-        self.loop_start = h.loop_start
-        self.loop_end = h.loop_end
-        self.num_loop_iters = h.num_loops + 1
-        self.loop_segment = list(range(h.loop_start, h.loop_end + 1))
-        self.begin_indices = list(range(h.loop_start))
-        self.end_indices = list(range(h.loop_end + 1, h.num_layers))
+        self.loop_pos_emb_index: dict[int, int] = {}
         if h.num_loops > 0:
-            loop_seg = self.loop_segment
+            loop_seg = list(range(h.loop_start, h.loop_end + 1))
             all_indices = list(range(h.loop_start))
-            for _ in range(h.num_loops + 1):
+            for loop_idx in range(h.num_loops + 1):
                 all_indices.extend(loop_seg)
+                self.loop_pos_emb_index[len(all_indices) - 1] = loop_idx
             all_indices.extend(range(h.loop_end + 1, h.num_layers))
             num_enc = len(all_indices) // 2
             self.encoder_indices: list[int] = all_indices[:num_enc]
@@ -564,9 +509,9 @@ class GPT(nn.Module):
         self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
-        self.hyperloop = (
-            HyperloopConnection(h.model_dim, h.hyperloop_streams, self.num_loop_iters)
-            if self.hyperloop_enabled else None
+        self.loop_pos_emb = (
+            nn.Parameter(torch.zeros(h.num_loops + 1, h.model_dim, dtype=torch.float32))
+            if h.loop_pos_emb_enabled and h.num_loops > 0 else None
         )
 
         self._init_weights()
@@ -582,42 +527,18 @@ class GPT(nn.Module):
                       module.weight.shape[1] >= 64):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
-    def _apply_decoder_skip(self, x: Tensor, skip: Tensor, skip_idx: int) -> Tensor:
-        scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip
-        if self.skip_gates is not None:
-            g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
-            return torch.lerp(scaled_skip, x, g)
-        return x + scaled_skip
-
-    def _attach_unused_hyperloop_params(self, x: Tensor) -> Tensor:
-        if self.hyperloop is None:
+    def _add_loop_pos_emb(self, x: Tensor, virtual_idx: int) -> Tensor:
+        if self.loop_pos_emb is None:
             return x
-        zero = x.new_zeros(())
-        for p in self.hyperloop.parameters():
-            zero = zero + p.to(dtype=x.dtype).sum() * 0.0
-        return x + zero
+        loop_idx = self.loop_pos_emb_index.get(virtual_idx)
+        if loop_idx is None:
+            return x
+        return x + self.loop_pos_emb[loop_idx].to(dtype=x.dtype)[None, None, :]
 
-    def _forward_hyperloop_body(self, x: Tensor, x0: Tensor) -> Tensor:
-        assert self.hyperloop is not None
-        for i in self.begin_indices:
-            x = self.blocks[i](x, x0)
-
-        streams = x.unsqueeze(2).expand(-1, -1, self.hyperloop.streams, -1).contiguous()
-        for loop_idx in range(self.num_loop_iters):
-            pre, post, res = self.hyperloop.gates(streams, loop_idx)
-            x_loop = (pre.to(dtype=streams.dtype).unsqueeze(-1) * streams).sum(dim=2)
-            for i in self.loop_segment:
-                x_loop = self.blocks[i](x_loop, x0)
-            x_loop = x_loop + self.hyperloop.loop_pos_emb[loop_idx].to(dtype=x_loop.dtype)[None, None, :]
-            streams = (
-                res.to(dtype=streams.dtype).unsqueeze(-1) * streams
-                + post.to(dtype=streams.dtype).unsqueeze(-1) * x_loop.unsqueeze(2)
-            )
-
-        x = streams.mean(dim=2)
-        for i in self.end_indices:
-            x = self.blocks[i](x, x0)
-        return x
+    def _attach_unused_loop_pos_emb(self, x: Tensor) -> Tensor:
+        if self.loop_pos_emb is None:
+            return x
+        return x + self.loop_pos_emb.to(dtype=x.dtype).sum() * 0.0
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -626,27 +547,29 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
         skips: list[Tensor] = []
-        if self.looping_active and self.hyperloop is not None:
-            x = self._forward_hyperloop_body(x, x0)
-            x = self.final_norm(x)
-            if self.head_proj is not None:
-                x = self.head_proj(x)
-            if self.tie_embeddings:
-                logits_proj = F.linear(x, self.tok_emb.weight)
-            else:
-                logits_proj = self.lm_head(x)
-            return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-
         enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
         dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
+        virtual_idx = 0
         for i in enc_iter:
             x = self.blocks[i](x, x0)
+            if self.looping_active:
+                x = self._add_loop_pos_emb(x, virtual_idx)
             skips.append(x)
+            virtual_idx += 1
         for skip_idx, i in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
-                x = self._apply_decoder_skip(x, skips.pop(), skip_idx)
+                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                if self.skip_gates is not None:
+                    g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                    x = torch.lerp(scaled_skip, x, g)
+                else:
+                    x = x + scaled_skip
             x = self.blocks[i](x, x0)
-        x = self._attach_unused_hyperloop_params(x)
+            if self.looping_active:
+                x = self._add_loop_pos_emb(x, virtual_idx)
+            virtual_idx += 1
+        if not self.looping_active:
+            x = self._attach_unused_loop_pos_emb(x)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -780,8 +703,8 @@ class Optimizers():
             scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
             scalar_params.append(base_model.skip_gates)
-        if base_model.hyperloop is not None:
-            scalar_params.extend(base_model.hyperloop.parameters())
+        if base_model.loop_pos_emb is not None:
+            scalar_params.append(base_model.loop_pos_emb)
 
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -1386,8 +1309,7 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
-        loop_start_frac = h.hyperloop_start_frac if h.hyperloop_enabled else h.enable_looping_at
-        if h.num_loops > 0 and not base_model.looping_active and frac >= loop_start_frac:
+        if h.num_loops > 0 and not base_model.looping_active and frac >= h.enable_looping_at:
             base_model.looping_active = True
             log(f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
         train_loss = step_fn(step, scale)
