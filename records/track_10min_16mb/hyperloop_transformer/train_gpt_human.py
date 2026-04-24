@@ -73,6 +73,7 @@ class Hyperparameters():
     enable_looping_at = float(os.environ.get('ENABLE_LOOPING_AT', 0.5))
     hyperloop_enabled = bool(int(os.environ.get('HYPERLOOP_ENABLED', '1')))
     hyperloop_streams = int(os.environ.get('HYPERLOOP_STREAMS', 4))
+    hyperloop_start_frac = float(os.environ.get('HYPERLOOP_START_FRAC', 0.0))
 
     # Optimizer
     min_lr = float(os.environ.get('MIN_LR', 0.0))
@@ -467,9 +468,15 @@ class HyperloopConnection(nn.Module):
         self.streams = streams
         self.num_loop_iters = num_loop_iters
         width = streams * dim
-        self.pre = nn.ModuleList([CastedLinear(width, streams, bias=True) for _ in range(num_loop_iters)])
-        self.post = nn.ModuleList([CastedLinear(width, streams, bias=True) for _ in range(num_loop_iters)])
-        self.res = nn.ModuleList([CastedLinear(width, streams, bias=True) for _ in range(num_loop_iters)])
+        self.pre = nn.ModuleList([CastedLinear(width, streams, bias=False) for _ in range(num_loop_iters)])
+        self.post = nn.ModuleList([CastedLinear(width, streams, bias=False) for _ in range(num_loop_iters)])
+        self.res = nn.ModuleList([CastedLinear(width, streams, bias=False) for _ in range(num_loop_iters)])
+        self.pre_bias = nn.Parameter(torch.empty(num_loop_iters, streams, dtype=torch.float32))
+        self.post_bias = nn.Parameter(torch.empty(num_loop_iters, streams, dtype=torch.float32))
+        self.res_bias = nn.Parameter(torch.empty(num_loop_iters, streams, dtype=torch.float32))
+        self.pre_alpha = nn.Parameter(torch.ones(num_loop_iters, dtype=torch.float32))
+        self.post_alpha = nn.Parameter(torch.ones(num_loop_iters, dtype=torch.float32))
+        self.res_alpha = nn.Parameter(torch.ones(num_loop_iters, dtype=torch.float32))
         self.loop_pos_emb = nn.Parameter(torch.zeros(num_loop_iters, dim, dtype=torch.float32))
 
         pre_bias = math.log((1.0 / streams) / (1.0 - 1.0 / streams))
@@ -477,15 +484,24 @@ class HyperloopConnection(nn.Module):
             pre._zero_init = True
             post._zero_init = True
             res._zero_init = True
-            nn.init.constant_(pre.bias, pre_bias)
-            nn.init.zeros_(post.bias)
-            nn.init.constant_(res.bias, -8.0)
+        nn.init.constant_(self.pre_bias, pre_bias)
+        nn.init.zeros_(self.post_bias)
+        nn.init.constant_(self.res_bias, -8.0)
 
     def gates(self, streams: Tensor, loop_idx: int) -> tuple[Tensor, Tensor, Tensor]:
         z = F.rms_norm(streams.flatten(2), (self.streams * self.dim,))
-        pre = torch.sigmoid(self.pre[loop_idx](z))
-        post = 2.0 * torch.sigmoid(self.post[loop_idx](z))
-        res = torch.sigmoid(self.res[loop_idx](z))
+        pre = torch.sigmoid(
+            self.pre_alpha[loop_idx].to(dtype=z.dtype) * self.pre[loop_idx](z)
+            + self.pre_bias[loop_idx].to(dtype=z.dtype)
+        )
+        post = 2.0 * torch.sigmoid(
+            self.post_alpha[loop_idx].to(dtype=z.dtype) * self.post[loop_idx](z)
+            + self.post_bias[loop_idx].to(dtype=z.dtype)
+        )
+        res = torch.sigmoid(
+            self.res_alpha[loop_idx].to(dtype=z.dtype) * self.res[loop_idx](z)
+            + self.res_bias[loop_idx].to(dtype=z.dtype)
+        )
         return pre, post, res
 
 
@@ -581,11 +597,10 @@ class GPT(nn.Module):
             zero = zero + p.to(dtype=x.dtype).sum() * 0.0
         return x + zero
 
-    def _forward_hyperloop_body(self, x: Tensor, x0: Tensor, skips: list[Tensor]) -> Tensor:
+    def _forward_hyperloop_body(self, x: Tensor, x0: Tensor) -> Tensor:
         assert self.hyperloop is not None
         for i in self.begin_indices:
             x = self.blocks[i](x, x0)
-            skips.append(x)
 
         streams = x.unsqueeze(2).expand(-1, -1, self.hyperloop.streams, -1).contiguous()
         for loop_idx in range(self.num_loop_iters):
@@ -600,10 +615,7 @@ class GPT(nn.Module):
             )
 
         x = streams.mean(dim=2)
-        skips.append(x)
-        for skip_idx, i in enumerate(self.end_indices):
-            if skip_idx < self.num_skip_weights and skips:
-                x = self._apply_decoder_skip(x, skips.pop(), skip_idx)
+        for i in self.end_indices:
             x = self.blocks[i](x, x0)
         return x
 
@@ -615,7 +627,7 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         if self.looping_active and self.hyperloop is not None:
-            x = self._forward_hyperloop_body(x, x0, skips)
+            x = self._forward_hyperloop_body(x, x0)
             x = self.final_norm(x)
             if self.head_proj is not None:
                 x = self.head_proj(x)
@@ -1374,7 +1386,8 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
-        if h.num_loops > 0 and not base_model.looping_active and frac >= h.enable_looping_at:
+        loop_start_frac = h.hyperloop_start_frac if h.hyperloop_enabled else h.enable_looping_at
+        if h.num_loops > 0 and not base_model.looping_active and frac >= loop_start_frac:
             base_model.looping_active = True
             log(f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
         train_loss = step_fn(step, scale)
