@@ -573,6 +573,14 @@ class GPT(nn.Module):
             return torch.lerp(scaled_skip, x, g)
         return x + scaled_skip
 
+    def _attach_unused_hyperloop_params(self, x: Tensor) -> Tensor:
+        if self.hyperloop is None:
+            return x
+        zero = x.new_zeros(())
+        for p in self.hyperloop.parameters():
+            zero = zero + p.to(dtype=x.dtype).sum() * 0.0
+        return x + zero
+
     def _forward_hyperloop_body(self, x: Tensor, x0: Tensor, skips: list[Tensor]) -> Tensor:
         assert self.hyperloop is not None
         for i in self.begin_indices:
@@ -626,6 +634,7 @@ class GPT(nn.Module):
             if skip_idx < self.num_skip_weights and skips:
                 x = self._apply_decoder_skip(x, skips.pop(), skip_idx)
             x = self.blocks[i](x, x0)
+        x = self._attach_unused_hyperloop_params(x)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
