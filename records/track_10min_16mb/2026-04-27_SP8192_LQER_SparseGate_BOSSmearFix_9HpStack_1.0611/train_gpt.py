@@ -425,6 +425,13 @@ class Hyperparameters:
         if artifact_dir
         else "final_model.int6.ptz"
     )
+    save_analysis_checkpoints = bool(
+        int(os.environ.get("SAVE_ANALYSIS_CHECKPOINTS", "0"))
+    )
+    analysis_checkpoint_dir = os.environ.get(
+        "ANALYSIS_CHECKPOINT_DIR",
+        os.path.join(artifact_dir if artifact_dir else "checkpoints", "analysis"),
+    )
 
 
 _logger_hparams = None
@@ -2651,6 +2658,7 @@ def serialize(h, base_model, code):
         log(f"Code size (uncompressed): {code_bytes_uncompressed} bytes")
         log(f"Code size (compressed): {code_bytes} bytes")
     sd_cpu = _unbank_state_dict(base_model.state_dict(), h.num_layers)
+    save_analysis_checkpoint(h, "pre_quant_unbanked_state.pt", sd_cpu)
     device = torch.device("cuda", h.local_rank)
     t0 = time.perf_counter()
     calib_loader = ShuffledSequenceLoader(h, device)
@@ -2664,6 +2672,9 @@ def serialize(h, base_model, code):
     )
     log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s")
     quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
+    save_analysis_checkpoint(
+        h, "post_quant_payload.pt", {"w": quant_result, "m": quant_meta}
+    )
     if h.compressor == "pergroup":
         import tempfile
         tmpdir = tempfile.mkdtemp(prefix="pgrp_")
@@ -2719,6 +2730,8 @@ def deserialize(h, device):
     kv_dim = h.num_kv_heads * head_dim
     hidden_dim = int(h.mlp_mult * h.model_dim)
     deq_state = _rebank_state_dict(deq_flat, h.num_layers, h.model_dim, kv_dim, hidden_dim)
+    save_analysis_checkpoint(h, "post_dequant_model.pt", deq_state)
+    save_analysis_checkpoint(h, "post_dequant_unbanked_state.pt", deq_flat)
     eval_model.load_state_dict(deq_state, strict=True)
     return eval_model
 
@@ -3328,6 +3341,22 @@ def timed_eval(label, fn, *args, **kwargs):
     return val_loss, val_bpb
 
 
+def _cpu_state_dict(state_dict):
+    return {
+        name: tensor.detach().cpu().clone()
+        for (name, tensor) in state_dict.items()
+    }
+
+
+def save_analysis_checkpoint(h, name, payload):
+    if not h.save_analysis_checkpoints or not h.is_main_process:
+        return
+    os.makedirs(h.analysis_checkpoint_dir, exist_ok=True)
+    path = os.path.join(h.analysis_checkpoint_dir, name)
+    torch.save(payload, path)
+    log(f"analysis_checkpoint:saved {path}", console=False)
+
+
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
@@ -3541,12 +3570,18 @@ def train_model(h, device, val_data):
     log(
         f"peak memory allocated: {torch.cuda.max_memory_allocated()//1024//1024} MiB reserved: {torch.cuda.max_memory_reserved()//1024//1024} MiB"
     )
+    save_analysis_checkpoint(
+        h, "final_pre_ema_model.pt", _cpu_state_dict(base_model.state_dict())
+    )
     log("ema:applying EMA weights")
     current_state = base_model.state_dict()
     avg_state = {
         name: t.to(dtype=current_state[name].dtype) for (name, t) in ema_state.items()
     }
     base_model.load_state_dict(avg_state, strict=True)
+    save_analysis_checkpoint(
+        h, "final_post_ema_pre_quant_model.pt", _cpu_state_dict(base_model.state_dict())
+    )
     return base_model, compiled_model, compiled_forward_logits
 
 
