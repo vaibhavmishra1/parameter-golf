@@ -366,6 +366,14 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # Experimental LQER candidate ranking / basis selection.
+    # raw: stock PR #1855 behavior, rank by ||E|| and SVD(E)
+    # hessian_diag: rank by ||E * sqrt(diag(H))|| and SVD(E * sqrt(diag(H)))
+    lqer_selection = os.environ.get("LQER_SELECTION", "raw")
+    load_hessians_path = os.environ.get("LOAD_HESSIANS_PATH", "")
+    save_hessians_path = os.environ.get("SAVE_HESSIANS_PATH", "")
+    quantize_only = bool(int(os.environ.get("QUANTIZE_ONLY", "0")))
+    load_analysis_model = os.environ.get("LOAD_ANALYSIS_MODEL", "")
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2224,6 +2232,36 @@ def _lqer_pack_asym(A, B, g=64):
     return qA, sA, qB, sB
 
 
+def _lqer_candidate(E, H, mode):
+    if mode == "raw":
+        return E, float(E.norm())
+    if mode == "hessian_diag":
+        hdiag = torch.diag(H.float()).clamp_min(0.0)
+        col_scale = torch.sqrt(hdiag + 1e-12).view(1, -1)
+        Ew = E * col_scale
+        return Ew, float(Ew.norm())
+    raise ValueError(f"unknown LQER_SELECTION={mode!r}")
+
+
+def _lqer_factors_from_basis(E, basis, mode):
+    if mode == "raw":
+        U, S, Vh = torch.linalg.svd(E, full_matrices=False)
+    elif mode == "hessian_diag":
+        U, S, Vh_w = torch.linalg.svd(basis, full_matrices=False)
+        # Recompute the column scale from the weighted basis robustly. Columns
+        # with all-zero error fall back to scale 1, which leaves Vh unchanged.
+        hscale = torch.ones(E.shape[1], dtype=E.dtype, device=E.device)
+        nonzero = E.abs().amax(dim=0) > 0
+        hscale[nonzero] = (
+            basis[:, nonzero].abs().amax(dim=0)
+            / E[:, nonzero].abs().amax(dim=0).clamp_min(1e-12)
+        ).clamp_min(1e-12)
+        Vh = Vh_w / hscale.view(1, -1)
+    else:
+        raise ValueError(f"unknown LQER_SELECTION={mode!r}")
+    return U, S, Vh
+
+
 def gptq_mixed_quantize(state_dict, hessians, h):
     result = {}
     meta = {}
@@ -2275,13 +2313,18 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         if lqer_on:
             W_q = q.float() * s.float().view(-1, 1)
             E = t.float() - W_q
-            lqer_cands[name] = (E, float(E.norm()))
+            basis, score = _lqer_candidate(E, hessians[name], h.lqer_selection)
+            lqer_cands[name] = (E, basis, score)
     if lqer_on and lqer_cands:
-        top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.lqer_top_k]
+        top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][2])[: h.lqer_top_k]
         asym_on = bool(getattr(h, "lqer_asym_enabled", False))
         asym_g = int(getattr(h, "lqer_asym_group", 64))
-        for (name, (E, _)) in top:
-            U, S, Vh = torch.linalg.svd(E, full_matrices=False)
+        log(
+            "LQER selection:"
+            + ", ".join(f" {name}={score:.3e}" for (name, (_, _, score)) in top)
+        )
+        for (name, (E, basis, _)) in top:
+            U, S, Vh = _lqer_factors_from_basis(E, basis, h.lqer_selection)
             r = min(h.lqer_rank, S.numel())
             A = (U[:, :r] * S[:r]).contiguous()
             B = Vh[:r, :].contiguous()
@@ -2660,17 +2703,26 @@ def serialize(h, base_model, code):
     sd_cpu = _unbank_state_dict(base_model.state_dict(), h.num_layers)
     save_analysis_checkpoint(h, "pre_quant_unbanked_state.pt", sd_cpu)
     device = torch.device("cuda", h.local_rank)
-    t0 = time.perf_counter()
-    calib_loader = ShuffledSequenceLoader(h, device)
-    log("GPTQ:collecting Hessians from calibration data...")
-    hessians = collect_hessians(
-        base_model,
-        calib_loader,
-        h,
-        device,
-        n_calibration_batches=h.gptq_calibration_batches,
-    )
-    log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s")
+    if h.load_hessians_path:
+        log(f"GPTQ:loading Hessians from {h.load_hessians_path}")
+        hessians = torch.load(h.load_hessians_path, map_location="cpu")
+        log(f"GPTQ:loaded {len(hessians)} Hessians")
+    else:
+        t0 = time.perf_counter()
+        calib_loader = ShuffledSequenceLoader(h, device)
+        log("GPTQ:collecting Hessians from calibration data...")
+        hessians = collect_hessians(
+            base_model,
+            calib_loader,
+            h,
+            device,
+            n_calibration_batches=h.gptq_calibration_batches,
+        )
+        log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s")
+        if h.save_hessians_path and h.is_main_process:
+            os.makedirs(os.path.dirname(h.save_hessians_path) or ".", exist_ok=True)
+            torch.save(hessians, h.save_hessians_path)
+            log(f"GPTQ:saved Hessians to {h.save_hessians_path}")
     quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
     save_analysis_checkpoint(
         h, "post_quant_payload.pt", {"w": quant_result, "m": quant_meta}
@@ -3607,19 +3659,35 @@ def train_and_eval(h, device):
         log(f"ttt_warm_start_a: {BatchedLinearLoRA._WARM_START_A}")
         log(f"ttt_weight_decay: {h.ttt_weight_decay}")
     else:
-        base_model, compiled_model, compiled_forward_logits = train_model(
-            h, device, val_data
-        )
-        torch._dynamo.reset()
-        timed_eval(
-            "diagnostic pre-quantization post-ema",
-            eval_val,
-            h,
-            device,
-            val_data,
-            compiled_model,
-            compiled_forward_logits,
-        )
+        if h.quantize_only:
+            if not h.load_analysis_model:
+                raise ValueError("QUANTIZE_ONLY=1 requires LOAD_ANALYSIS_MODEL=/path/to/model.pt")
+            log(f"QUANTIZE_ONLY=1 — loading model from {h.load_analysis_model}")
+            base_model = GPT(h).to(device).bfloat16()
+            restore_fp32_params(base_model)
+            state = torch.load(h.load_analysis_model, map_location="cpu")
+            base_model.load_state_dict(state, strict=True)
+            if h.num_loops > 0:
+                base_model.looping_active = True
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+            compiled_forward_logits = torch.compile(
+                base_model.forward_logits, dynamic=False, fullgraph=True
+            )
+        else:
+            base_model, compiled_model, compiled_forward_logits = train_model(
+                h, device, val_data
+            )
+            torch._dynamo.reset()
+        if (not h.quantize_only) or bool(int(os.environ.get("QUANTIZE_ONLY_PREQUANT_EVAL", "0"))):
+            timed_eval(
+                "diagnostic pre-quantization post-ema",
+                eval_val,
+                h,
+                device,
+                val_data,
+                compiled_model,
+                compiled_forward_logits,
+            )
         if os.environ.get("PREQUANT_ONLY", "0") == "1":
             log("PREQUANT_ONLY=1 — skipping serialize/GPTQ/post-quant eval/TTT")
             return
