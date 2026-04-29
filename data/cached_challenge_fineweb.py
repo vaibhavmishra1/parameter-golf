@@ -149,6 +149,10 @@ def main() -> None:
     dataset_prefix = f"{REMOTE_ROOT_PREFIX}/datasets/{dataset_dir}"
     for i in range(val_shards):
         get(f"{dataset_prefix}/fineweb_val_{i:06d}.bin")
+    # Download byte-count sidecar files if this dataset has them (needed for accurate BPB).
+    if dataset_entry.get("val_bytes_glob"):
+        for i in range(val_shards):
+            get(f"{dataset_prefix}/fineweb_val_bytes_{i:06d}.bin")
     for i in range(train_shards):
         get(f"{dataset_prefix}/fineweb_train_{i:06d}.bin")
 
