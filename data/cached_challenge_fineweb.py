@@ -18,7 +18,10 @@ def dataset_dir_for_variant(name: str) -> str:
         return "fineweb10B_byte260"
     if name.startswith("sp") and name[2:].isdigit():
         return f"fineweb10B_{name}"
-    raise ValueError(f"unsupported variant {name!r}; expected byte260 or sp<VOCAB_SIZE>")
+    # CaseOps variants: sp<VOCAB>_lossless_caps_caseops_v1_reserved (PR #1729)
+    if name.startswith("sp") and "_" in name:
+        return f"fineweb10B_{name}"
+    raise ValueError(f"unsupported variant {name!r}; expected byte260, sp<VOCAB_SIZE>, or sp<VOCAB_SIZE>_<suffix>")
 
 
 def local_path_for_remote(relative_path: str) -> Path:
