@@ -366,6 +366,43 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # ===== Parcae stable looped-LM injection (Prairie et al., arXiv:2604.12946;
+    # sandyresearch/parcae @ parcae_lm/modules/injection.py::DiagonalInjection) =====
+    # Wraps the existing PR-1855 layer-loop (LOOP_START..LOOP_END repeated NUM_LOOPS+1
+    # times) with an LTI dynamical system whose spectral norm is provably <= 1:
+    #   h_{t+1} = exp(-dt * exp(A_log)) * h_t + dt * (B @ rmsnorm(e))
+    # `e` is the residual stream value the FIRST time we enter LOOP_START (the
+    # "prelude output"). Injection is applied at every subsequent re-entry of
+    # LOOP_START, which is exactly NUM_LOOPS times per forward pass. Disabled
+    # by default so the file remains a strict superset of PR #1855.
+    parcae_enabled = bool(int(os.environ.get("PARCAE_ENABLED", "0")))
+    # Initial spectral norm rho(A_bar) = exp(-softplus(dt_bias) * exp(A_log)).
+    # Paper's default for fully-recurrent training is sqrt(1/5) = 0.4472.
+    # Default 0.95 here ("gentle injection") matches the PR-1855 case where
+    # h_t already carries rich content from layers 0..LOOP_START-1: large dt
+    # at init would clobber that. Tune up toward 0.5..0.7 once stable.
+    parcae_decay_target = float(os.environ.get("PARCAE_DECAY_TARGET", 0.95))
+    # B parameterization. "diag": (d_state,) per-channel scalar (~2 KB raw, fits
+    # fp16 passthrough trivially). "full": (d_state, d_state) full matrix,
+    # paper-faithful (init=identity if square) but adds ~256 KB and needs an
+    # explicit gptq passthrough. Diag is what Mamba uses; almost-as-expressive.
+    parcae_b_shape = os.environ.get("PARCAE_B_SHAPE", "diag")
+    # Apply RMSNorm to e once at capture time (paper Appendix J: input-norm of
+    # e stabilizes long recurrences without restricting B). Cheap (~0 params).
+    parcae_e_norm = bool(int(os.environ.get("PARCAE_E_NORM", "1")))
+    # Single shared injection module across all loop transitions (paper-faithful
+    # — Parcae's `transformer.adapter` is one module called T times). Set to 0
+    # to allocate one ParcaeInjection per transition (NUM_LOOPS modules).
+    parcae_share_injection = bool(int(os.environ.get("PARCAE_SHARE_INJECTION", "1")))
+    # Drop the existing per-block resid_mix x0 mixing inside layers
+    # [LOOP_START..LOOP_END] when Parcae is enabled. Parcae provides its own
+    # input injection so the per-block mix becomes redundant (and competes for
+    # capacity). Keeps resid_mix on prelude (0..LOOP_START-1) and coda layers.
+    parcae_disable_resid_mix_in_loop = bool(int(os.environ.get("PARCAE_DISABLE_RESID_MIX_IN_LOOP", "0")))
+    # Apply Parcae injection AFTER U-Net skip-add (default, matches paper:
+    # adapter is the first preprocessing inside each loop iteration) or BEFORE
+    # (alternative ordering). Only matters at decoder skip_idx that hits LOOP_START.
+    parcae_after_unet_skip = bool(int(os.environ.get("PARCAE_AFTER_UNET_SKIP", "1")))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1082,6 +1119,113 @@ class MLP(nn.Module):
         return F.linear(hidden, down_w.to(x.dtype))
 
 
+class ParcaeInjection(nn.Module):
+    """Parcae diagonal SSM input-injection (Prairie et al., arXiv:2604.12946).
+
+    Faithful port of sandyresearch/parcae's `parcae_lm.modules.injection.DiagonalInjection`,
+    with two adaptations to PR #1855's setting:
+
+      1. Optional ``b_shape="diag"`` (default): B is a (d_state,) per-channel
+         scalar instead of a full (d_state, d_state) matrix. Paper-faithful is
+         "full"; we default to "diag" to fit the 16 MB artifact budget.
+      2. Optional input-norm on ``e`` (paper Appendix J), parameter-free RMSNorm.
+
+    Update rule (matches DiagonalInjection.forward exactly, modulo b_shape):
+
+        dt    = softplus(dt_bias)              # >= 0, shape (d_state,)
+        A     = exp(A_log)                     # > 0, shape (d_state,)
+        decay = exp(-dt * A) in (0, 1]         # element-wise, ALWAYS contractive
+        h_new = h * decay + dt * (B @ rmsnorm(e))
+
+    Stability: rho(A_bar) = max(decay) <= 1 by construction (see Theorem 1 of the
+    paper). Init: A_log=0 (-> A=1), dt_bias=inv_softplus(-log(decay_target)),
+    B=identity (or zeros-then-fill_diagonal_(1) for diag), so the injection is a
+    well-defined SSM step from the very first training step.
+
+    All learnable params get ``_no_weight_decay = True`` and a ``parcae_`` prefix
+    so PR #1855's CONTROL_TENSOR_NAME_PATTERNS keeps them in fp32 + scalar AdamW.
+    """
+
+    def __init__(
+        self,
+        d_model,
+        d_state=None,
+        decay_target=0.95,
+        b_shape="diag",
+        e_norm=True,
+    ):
+        super().__init__()
+        d_state = d_state or d_model
+        self.d_model = d_model
+        self.d_state = d_state
+        self.b_shape = b_shape
+        self.e_norm_enabled = e_norm
+        # A_log: zeros => A = exp(0) = 1 at init; learnable per-channel decay
+        # rate (the only quantity that can break stability if it goes negative,
+        # which exp(.) prevents).
+        self.parcae_A_log = nn.Parameter(torch.zeros(d_state, dtype=torch.float32))
+        # dt_bias: inverse-softplus of the target product so that softplus(b) =
+        # -log(decay_target) and the initial decay equals decay_target.
+        target_product = -math.log(max(min(decay_target, 1.0 - 1e-6), 1e-6))
+        inv_dt = math.log(math.expm1(target_product))
+        self.parcae_dt_bias = nn.Parameter(
+            torch.full((d_state,), inv_dt, dtype=torch.float32)
+        )
+        # B: per-channel (diag) or full (d_state, d_model). Identity init so
+        # the injection at init reduces to the per-channel SSM update on e.
+        if b_shape == "diag":
+            assert d_state == d_model, (
+                "PARCAE_B_SHAPE=diag requires d_state == d_model "
+                f"(got {d_state} != {d_model}); use b_shape='full' to mismatch."
+            )
+            self.parcae_B = nn.Parameter(torch.ones(d_state, dtype=torch.float32))
+        elif b_shape == "full":
+            B = torch.empty(d_state, d_model, dtype=torch.float32)
+            if d_state == d_model:
+                B.zero_()
+                for i in range(d_state):
+                    B[i, i] = 1.0
+            else:
+                nn.init.orthogonal_(B)
+            self.parcae_B = nn.Parameter(B)
+        else:
+            raise ValueError(f"Unknown PARCAE_B_SHAPE: {b_shape}")
+        for p in (self.parcae_A_log, self.parcae_dt_bias, self.parcae_B):
+            p._no_weight_decay = True
+
+    def forward(self, h, e):
+        # h: (B, T, d_state). e: (B, T, d_model). Returns (B, T, d_state).
+        # All math is done in h.dtype for compute, with the SSM params kept in
+        # fp32 master copies (cast each call). This matches Mamba's convention
+        # and PR #1855's CastedLinear pattern.
+        if self.e_norm_enabled:
+            e = F.rms_norm(e, (e.size(-1),))
+        dt = F.softplus(self.parcae_dt_bias.float()).to(h.dtype)
+        A = torch.exp(self.parcae_A_log.float()).to(h.dtype)
+        decay = torch.exp(-dt * A)
+        if self.b_shape == "diag":
+            # b * e is element-wise per-channel; equivalent to a diagonal B matmul
+            # but ~2 KB instead of ~1 MB.
+            Be = e * self.parcae_B.to(e.dtype)
+        else:
+            Be = F.linear(e, self.parcae_B.to(e.dtype))
+        return h * decay + dt * Be
+
+    @torch.no_grad()
+    def spectral_norm(self):
+        """rho(A_bar) at the current point. Always <= 1 if A_log is finite."""
+        dt = F.softplus(self.parcae_dt_bias.float())
+        A = torch.exp(self.parcae_A_log.float())
+        return float(torch.exp(-dt * A).max().item())
+
+    @torch.no_grad()
+    def contraction_factor(self):
+        """Mean per-channel decay (paper's "contraction_factor" diagnostic)."""
+        dt = F.softplus(self.parcae_dt_bias.float())
+        A = torch.exp(self.parcae_A_log.float())
+        return float(torch.exp(-dt * A).mean().item())
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -1122,10 +1266,17 @@ class Block(nn.Module):
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        # When Parcae owns the input-injection for this block (via PARCAE_DISABLE_RESID_MIX_IN_LOOP=1
+        # for layers in [LOOP_START..LOOP_END]), GPT.__init__ flips this flag so the per-block
+        # x0 mixing is bypassed; the rest of the block (attn/mlp scales, norms) is unchanged.
+        self.bypass_resid_mix = False
 
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        if self.bypass_resid_mix:
+            x_in = x
+        else:
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(
             self.attn_norm(x_in) * self.ln_scale_factor,
             q_w, k_w, v_w, out_w,
@@ -1249,6 +1400,95 @@ class GPT(nn.Module):
             self.smear_gate = CastedLinear(self.smear_window, 1, bias=False)
             self.smear_gate._zero_init = True
             self.smear_lambda = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        # ===== Parcae stable looped-LM injection =====
+        # The PR-1855 layer-loop expands `[loop_start..loop_end]` repeated
+        # `num_loops + 1` times into `encoder_indices` and `decoder_indices`.
+        # Parcae replaces the implicit `h_{t+1} = R(h_t, e)` recurrence (which
+        # has rho(A_bar)=1, prone to blow up at depth) with the LTI rule
+        # `h_{t+1} = A_bar h_t + B_bar e + (R(h_t, e) - h_t)` where A_bar is
+        # parameterized as a stable diagonal exp(-dt*A) factor. Concretely we
+        # interleave a `ParcaeInjection` call right BEFORE every re-entry of
+        # `loop_start` (i.e., at iter boundaries 1..num_loops). The first
+        # entry to `loop_start` captures `e` (the prelude output).
+        self.parcae_enabled = bool(h.parcae_enabled and h.num_loops > 0)
+        self.parcae_loop_start = int(h.loop_start)
+        self.parcae_e_norm_at_capture = bool(h.parcae_e_norm)
+        self.parcae_after_unet_skip = bool(h.parcae_after_unet_skip)
+        if self.parcae_enabled:
+            n_inject = 1 if h.parcae_share_injection else int(h.num_loops)
+            self.parcae_injections = nn.ModuleList([
+                ParcaeInjection(
+                    d_model=h.model_dim,
+                    d_state=h.model_dim,
+                    decay_target=float(h.parcae_decay_target),
+                    b_shape=str(h.parcae_b_shape),
+                    # When E-norm is "at capture" (true to paper's prelude_norm),
+                    # the per-injection module sees an already-normed e and
+                    # should NOT re-normalize. When E-norm is off, also off here.
+                    e_norm=False,
+                )
+                for _ in range(max(n_inject, 1))
+            ])
+            self.parcae_share_injection = bool(h.parcae_share_injection)
+            # Pre-compute boundary positions (positions in encoder_indices /
+            # decoder_indices where the index equals loop_start AND it is NOT
+            # the first such occurrence). The first occurrence is the e-capture
+            # site; subsequent occurrences are injection sites.
+            enc_b, dec_b, capture_in_enc, capture_pos_in_enc = [], [], False, -1
+            seen_first = False
+            for pos, idx in enumerate(self.encoder_indices):
+                if idx == self.parcae_loop_start:
+                    if not seen_first:
+                        seen_first = True
+                        capture_in_enc = True
+                        capture_pos_in_enc = pos
+                    else:
+                        enc_b.append(pos)
+            for pos, idx in enumerate(self.decoder_indices):
+                if idx == self.parcae_loop_start:
+                    if not seen_first:
+                        seen_first = True
+                    else:
+                        dec_b.append(pos)
+            self._parcae_enc_boundaries = tuple(enc_b)
+            self._parcae_dec_boundaries = tuple(dec_b)
+            self._parcae_capture_in_enc = capture_in_enc
+            self._parcae_capture_pos_in_enc = capture_pos_in_enc
+            # Also find capture position in decoder if not in encoder (edge case
+            # for very small num_loops / large loop_start where prelude itself
+            # spans across the encoder/decoder split).
+            if not capture_in_enc:
+                for pos, idx in enumerate(self.decoder_indices):
+                    if idx == self.parcae_loop_start:
+                        self._parcae_capture_pos_in_dec = pos
+                        break
+                else:
+                    self._parcae_capture_pos_in_dec = -1
+            else:
+                self._parcae_capture_pos_in_dec = -1
+            n_boundaries = len(enc_b) + len(dec_b)
+            assert n_boundaries == int(h.num_loops), (
+                f"Parcae expected {h.num_loops} loop-iter boundaries, found "
+                f"{n_boundaries} (enc={enc_b}, dec={dec_b}). Verify "
+                f"loop_start={h.loop_start}, loop_end={h.loop_end}, "
+                f"num_loops={h.num_loops}."
+            )
+            if (not h.parcae_share_injection) and len(self.parcae_injections) != n_boundaries:
+                raise ValueError(
+                    f"Per-boundary injection requested but ModuleList size "
+                    f"({len(self.parcae_injections)}) != boundary count ({n_boundaries})."
+                )
+            # Optionally bypass per-block resid_mix on layers in the loop range.
+            if h.parcae_disable_resid_mix_in_loop:
+                for li in range(h.loop_start, h.loop_end + 1):
+                    self.blocks[li].bypass_resid_mix = True
+        else:
+            self._parcae_enc_boundaries = ()
+            self._parcae_dec_boundaries = ()
+            self._parcae_capture_pos_in_enc = -1
+            self._parcae_capture_in_enc = False
+            self._parcae_capture_pos_in_dec = -1
+            self.parcae_share_injection = True
         self._init_weights()
 
     def _init_weights(self):
@@ -1294,8 +1534,11 @@ class GPT(nn.Module):
         cu_seqlens=None, max_seqlen=0,
     ):
         block = self.blocks[block_idx]
-        mix = block.resid_mix.to(dtype=lane0.dtype)
-        attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+        if getattr(block, "bypass_resid_mix", False):
+            attn_read = lane0
+        else:
+            mix = block.resid_mix.to(dtype=lane0.dtype)
+            attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
         attn_out = block.attn(
             block.attn_norm(attn_read) * block.ln_scale_factor,
             q_w, k_w, v_w, out_w,
@@ -1351,7 +1594,31 @@ class GPT(nn.Module):
                 self.num_encoder_layers + self.num_decoder_layers,
             )
         )
-        for i in enc_iter:
+        # Parcae state. `parcae_e` is captured the FIRST time we enter
+        # `loop_start` (typically post-prelude). At every subsequent re-entry
+        # (precomputed in self._parcae_enc_boundaries / self._parcae_dec_boundaries),
+        # we apply `h <- A_bar h + B_bar e` before the block call. When Parcae
+        # is disabled (or looping_active=False), all of this is a no-op.
+        parcae_active = self.parcae_enabled and self.looping_active
+        parcae_e = None
+        parcae_iter = 0  # which transition (0..num_loops-1) we're on next
+        for pos, i in enumerate(enc_iter):
+            if parcae_active:
+                if i == self.parcae_loop_start and parcae_e is None:
+                    # First entry: capture e (paper's "input_embeds" for adapter).
+                    parcae_e = (
+                        F.rms_norm(x, (x.size(-1),))
+                        if self.parcae_e_norm_at_capture
+                        else x
+                    )
+                elif pos in self._parcae_enc_boundaries:
+                    inj = (
+                        self.parcae_injections[0]
+                        if self.parcae_share_injection
+                        else self.parcae_injections[parcae_iter]
+                    )
+                    x = inj(x, parcae_e)
+                    parcae_iter += 1
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             skips.append(x)
@@ -1377,6 +1644,20 @@ class GPT(nn.Module):
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                 )
             else:
+                # Optionally apply Parcae BEFORE the U-Net skip-add (alt mode).
+                if (
+                    parcae_active
+                    and parcae_e is not None
+                    and (not self.parcae_after_unet_skip)
+                    and skip_idx in self._parcae_dec_boundaries
+                ):
+                    inj = (
+                        self.parcae_injections[0]
+                        if self.parcae_share_injection
+                        else self.parcae_injections[parcae_iter]
+                    )
+                    x = inj(x, parcae_e)
+                    parcae_iter += 1
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
                         self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
@@ -1387,6 +1668,30 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
+                # Default (paper-faithful) ordering: Parcae adapter is the LAST
+                # preprocessing step before the loop body. Capture-in-decoder
+                # edge case shares this branch — the first time we enter
+                # `loop_start` in decoder, we capture e from the post-skip x
+                # (semantically: the value entering the loop region).
+                if parcae_active and i == self.parcae_loop_start:
+                    if parcae_e is None and skip_idx == self._parcae_capture_pos_in_dec:
+                        parcae_e = (
+                            F.rms_norm(x, (x.size(-1),))
+                            if self.parcae_e_norm_at_capture
+                            else x
+                        )
+                    elif (
+                        parcae_e is not None
+                        and self.parcae_after_unet_skip
+                        and skip_idx in self._parcae_dec_boundaries
+                    ):
+                        inj = (
+                            self.parcae_injections[0]
+                            if self.parcae_share_injection
+                            else self.parcae_injections[parcae_iter]
+                        )
+                        x = inj(x, parcae_e)
+                        parcae_iter += 1
                 x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
@@ -1453,7 +1758,26 @@ class GPT(nn.Module):
             )
         )
         slot = 0
-        for i in enc_iter:
+        # Mirror _forward_hidden's Parcae logic on the TTT path.
+        parcae_active = self.parcae_enabled and self.looping_active
+        parcae_e = None
+        parcae_iter = 0
+        for pos, i in enumerate(enc_iter):
+            if parcae_active:
+                if i == self.parcae_loop_start and parcae_e is None:
+                    parcae_e = (
+                        F.rms_norm(x, (x.size(-1),))
+                        if self.parcae_e_norm_at_capture
+                        else x
+                    )
+                elif pos in self._parcae_enc_boundaries:
+                    inj = (
+                        self.parcae_injections[0]
+                        if self.parcae_share_injection
+                        else self.parcae_injections[parcae_iter]
+                    )
+                    x = inj(x, parcae_e)
+                    parcae_iter += 1
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
             slot += 1
@@ -1480,6 +1804,19 @@ class GPT(nn.Module):
                     q_w, k_w, v_w, out_w, up_w, down_w,
                 )
             else:
+                if (
+                    parcae_active
+                    and parcae_e is not None
+                    and (not self.parcae_after_unet_skip)
+                    and skip_idx in self._parcae_dec_boundaries
+                ):
+                    inj = (
+                        self.parcae_injections[0]
+                        if self.parcae_share_injection
+                        else self.parcae_injections[parcae_iter]
+                    )
+                    x = inj(x, parcae_e)
+                    parcae_iter += 1
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
                         self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
@@ -1490,6 +1827,25 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
+                if parcae_active and i == self.parcae_loop_start:
+                    if parcae_e is None and skip_idx == self._parcae_capture_pos_in_dec:
+                        parcae_e = (
+                            F.rms_norm(x, (x.size(-1),))
+                            if self.parcae_e_norm_at_capture
+                            else x
+                        )
+                    elif (
+                        parcae_e is not None
+                        and self.parcae_after_unet_skip
+                        and skip_idx in self._parcae_dec_boundaries
+                    ):
+                        inj = (
+                            self.parcae_injections[0]
+                            if self.parcae_share_injection
+                            else self.parcae_injections[parcae_iter]
+                        )
+                        x = inj(x, parcae_e)
+                        parcae_iter += 1
                 x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
             slot += 1
         if lane0 is not None:
@@ -1507,8 +1863,11 @@ class GPT(nn.Module):
         ).reshape(bsz, sl)
 
     def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
-        mix = block.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        if getattr(block, "bypass_resid_mix", False):
+            x_in = x
+        else:
+            mix = block.resid_mix.to(dtype=x.dtype)
+            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
@@ -1570,8 +1929,11 @@ class GPT(nn.Module):
         q_w, k_w, v_w, out_w, up_w, down_w,
     ):
         block = self.blocks[block_idx]
-        mix = block.resid_mix.to(dtype=lane0.dtype)
-        attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+        if getattr(block, "bypass_resid_mix", False):
+            attn_read = lane0
+        else:
+            mix = block.resid_mix.to(dtype=lane0.dtype)
+            attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
         n = block.attn_norm(attn_read) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
@@ -1888,7 +2250,10 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda",
+        # `parcae_` prefix routes ParcaeInjection's A_log/dt_bias/B params into
+        # the fp32 + scalar AdamW + gptq-passthrough buckets (matches Mamba's
+        # `_no_weight_decay` convention for SSM transition matrices).
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda,parcae_",
     ).split(",")
     if pattern
 )
@@ -1925,6 +2290,13 @@ class Optimizers:
         if getattr(base_model, "smear_gate_enabled", False):
             scalar_params.append(base_model.smear_gate.weight)
             scalar_params.append(base_model.smear_lambda)
+        # Parcae injection params (A_log, dt_bias, B). Live on GPT root under
+        # `parcae_injections.{i}`. SSM convention: NO weight decay. Routed to
+        # the same scalar AdamW but in their own param-group so they get WD=0.
+        parcae_params = []
+        if getattr(base_model, "parcae_enabled", False):
+            for inj in base_model.parcae_injections:
+                parcae_params.extend([inj.parcae_A_log, inj.parcae_dt_bias, inj.parcae_B])
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [
             {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}
@@ -1946,8 +2318,18 @@ class Optimizers:
         )
         for group in self.optimizer_muon.param_groups:
             group["base_lr"] = h.matrix_lr
+        scalar_groups = [{"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}]
+        if parcae_params:
+            # Per-group weight_decay overrides the optimizer-level default.
+            # Mamba/Parcae convention: SSM transition matrices have WD=0.
+            scalar_groups.append({
+                "params": parcae_params,
+                "lr": h.scalar_lr,
+                "base_lr": h.scalar_lr,
+                "weight_decay": 0.0,
+            })
         self.optimizer_scalar = torch.optim.AdamW(
-            [{"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}],
+            scalar_groups,
             betas=(h.beta1, h.beta2),
             eps=h.adam_eps,
             weight_decay=h.adam_wd,
@@ -1960,6 +2342,7 @@ class Optimizers:
         ]
         self.replicated_params = list(tok_params[0]["params"])
         self.replicated_params.extend(scalar_params)
+        self.replicated_params.extend(parcae_params)
         self.replicated_large_params = []
         self.replicated_packed_params = []
         for p in self.replicated_params:
@@ -2247,6 +2630,15 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         if not t.is_floating_point() or t.numel() <= 65536:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough (float16)"
+            continue
+        # Parcae SSM params bypass GPTQ unconditionally: there are no Hessians
+        # collected for them (no input hooks fire on ParcaeInjection), and the
+        # diagonal A / dt / B vectors are not nicely quantizable structures.
+        # Diagonal B (~2 KB) hits the numel<=65536 passthrough above; full B
+        # (262 KB raw / 131 KB fp16) lands here and is passed through as fp16.
+        if "parcae_" in name:
+            result[name] = t.to(torch.float16)
+            meta[name] = "passthrough (float16, parcae)"
             continue
         if "tok_emb" in name:
             cs = h.embed_clip_sigmas

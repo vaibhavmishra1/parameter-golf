@@ -9,3 +9,7 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+*.txt
+*.log
+# Model checkpoints are often >100 MB (GitHub limit); keep quantized .ptz in git instead
+records/**/checkpoints/*.pt
