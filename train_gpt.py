@@ -86,6 +86,23 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Optional post-training quantization ablation; training is unchanged.
+    quant_ablation = bool(int(os.environ.get("QUANT_ABLATION", "0")))
+    quant_ablation_methods = tuple(
+        method.strip()
+        for method in os.environ.get("QUANT_ABLATION_METHODS", "int8,gptq,gptq_lqer,coquant_lqer").split(",")
+        if method.strip()
+    )
+    quant_ablation_bits = int(os.environ.get("QUANT_ABLATION_BITS", "8"))
+    quant_ablation_calib_batches = int(os.environ.get("QUANT_ABLATION_CALIB_BATCHES", "8"))
+    quant_ablation_lqer_rank = int(os.environ.get("QUANT_ABLATION_LQER_RANK", "4"))
+    quant_ablation_lqer_top_k = int(os.environ.get("QUANT_ABLATION_LQER_TOP_K", "8"))
+    quant_ablation_lqer_factor_bits = int(os.environ.get("QUANT_ABLATION_LQER_FACTOR_BITS", "8"))
+    quant_ablation_clip_sigmas = float(os.environ.get("QUANT_ABLATION_CLIP_SIGMAS", "3.0"))
+    quant_ablation_gptq_damp = float(os.environ.get("QUANT_ABLATION_GPTQ_DAMP", "0.01"))
+    quant_ablation_gptq_block_size = int(os.environ.get("QUANT_ABLATION_GPTQ_BLOCK_SIZE", "128"))
+    quant_ablation_hook_max_rows = int(os.environ.get("QUANT_ABLATION_HOOK_MAX_ROWS", "16384"))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -420,6 +437,337 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
+
+
+def quantize_weight_symmetric(w: Tensor, bits: int, clip_sigmas: float | None = None) -> tuple[Tensor, Tensor]:
+    qmax = 2 ** (bits - 1) - 1
+    if qmax > 127:
+        raise ValueError("This ablation stores quantized values in int8, so bits must be <= 8")
+    w32 = w.float().cpu().contiguous()
+    if w32.ndim == 2:
+        if clip_sigmas is None:
+            clip_abs = torch.quantile(w32.abs(), INT8_CLIP_Q, dim=1)
+        else:
+            clip_abs = clip_sigmas * w32.std(dim=1)
+        scale = (clip_abs / qmax).clamp_min(1e-10).to(torch.float16)
+        sf = scale.float().view(-1, 1)
+        q = torch.clamp(torch.round(w32 / sf), -qmax, qmax).to(torch.int8).contiguous()
+        return q, scale.contiguous()
+    clip_abs = float(torch.quantile(w32.abs().flatten(), INT8_CLIP_Q).item()) if w32.numel() else 0.0
+    scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float16)
+    q = torch.clamp(torch.round(w32 / scale.float()), -qmax, qmax).to(torch.int8).contiguous()
+    return q, scale
+
+
+def dequantize_weight_symmetric(q: Tensor, scale: Tensor, dtype: torch.dtype) -> Tensor:
+    if scale.ndim > 0:
+        w = q.float() * scale.float().view(q.shape[0], *([1] * (q.ndim - 1)))
+    else:
+        w = q.float() * float(scale.item())
+    return w.to(dtype=dtype).contiguous()
+
+
+def gptq_quantize_weight(w: Tensor, hessian: Tensor, bits: int, clip_sigmas: float, damp: float, block_size: int) -> tuple[Tensor, Tensor]:
+    qmax = 2 ** (bits - 1) - 1
+    if qmax > 127:
+        raise ValueError("This ablation stores quantized values in int8, so bits must be <= 8")
+    w_orig = w.float().cpu().contiguous()
+    rows, cols = w_orig.shape
+    h = hessian.float().cpu().contiguous()
+    if h.shape != (cols, cols):
+        return quantize_weight_symmetric(w_orig, bits, clip_sigmas)
+    h = 0.5 * (h + h.T)
+    diag = torch.diag(h)
+    dead = diag <= 0
+    if dead.any():
+        h[dead, dead] = 1.0
+    mean_diag = torch.diag(h).mean().clamp_min(1e-8)
+    h.diagonal().add_(float(damp) * mean_diag)
+    perm = torch.argsort(torch.diag(h), descending=True)
+    invperm = torch.argsort(perm)
+    h = h[perm][:, perm]
+    w_work = w_orig[:, perm].clone()
+    if dead.any():
+        w_work[:, dead[perm]] = 0.0
+    eye = torch.eye(cols, dtype=h.dtype)
+    for attempt in range(5):
+        try:
+            chol = torch.linalg.cholesky(h + eye * (mean_diag * (10.0 ** attempt) * 1e-7))
+            break
+        except RuntimeError:
+            chol = None
+    if chol is None:
+        return quantize_weight_symmetric(w_orig, bits, clip_sigmas)
+    hinv = torch.cholesky_inverse(chol)
+    hinv = torch.linalg.cholesky(hinv, upper=True)
+    scale = (clip_sigmas * w_orig.std(dim=1) / qmax).clamp_min(1e-10).to(torch.float16)
+    sf = scale.float()
+    q = torch.zeros(rows, cols, dtype=torch.int8)
+    for i1 in range(0, cols, block_size):
+        i2 = min(i1 + block_size, cols)
+        w_block = w_work[:, i1:i2].clone()
+        hinv_block = hinv[i1:i2, i1:i2]
+        err_block = torch.zeros(rows, i2 - i1)
+        for j in range(i2 - i1):
+            w_col = w_block[:, j]
+            d = hinv_block[j, j].clamp_min(1e-8)
+            q_col = torch.clamp(torch.round(w_col / sf), -qmax, qmax)
+            q[:, i1 + j] = q_col.to(torch.int8)
+            err = (w_col - q_col.float() * sf) / d
+            err_block[:, j] = err
+            w_block[:, j:] -= err[:, None] * hinv_block[j, j:][None, :]
+        if i2 < cols:
+            w_work[:, i2:] -= err_block @ hinv[i1:i2, i2:]
+    return q[:, invperm].contiguous(), scale.contiguous()
+
+
+def pack_lowrank_factor(t: Tensor, bits: int) -> tuple[Tensor, Tensor]:
+    qmax = 2 ** (bits - 1) - 1
+    if qmax > 127:
+        raise ValueError("This ablation stores low-rank factors in int8, so bits must be <= 8")
+    t32 = t.float().cpu().contiguous()
+    scale = (t32.abs().amax(dim=1).clamp_min(1e-10) / qmax).to(torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float().view(-1, 1)), -qmax, qmax).to(torch.int8).contiguous()
+    return q, scale.contiguous()
+
+
+def unpack_lowrank_factor(q: Tensor, scale: Tensor) -> Tensor:
+    return q.float() * scale.float().view(-1, 1)
+
+
+def collect_linear_input_covariances(
+    model: nn.Module,
+    args: Hyperparameters,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+) -> tuple[dict[str, Tensor], dict[str, int]]:
+    covs: dict[str, Tensor] = {}
+    counts: dict[str, int] = {}
+    handles = []
+    max_rows = max(args.quant_ablation_hook_max_rows, 0)
+
+    def add_cov(name: str, x: Tensor) -> None:
+        x = x.detach().float()
+        if x.ndim == 3:
+            x = x.reshape(-1, x.shape[-1])
+        if max_rows > 0 and x.shape[0] > max_rows:
+            stride = max(x.shape[0] // max_rows, 1)
+            x = x[::stride][:max_rows]
+        if name not in covs:
+            covs[name] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32, device=device)
+            counts[name] = 0
+        covs[name].addmm_(x.T, x)
+        counts[name] += int(x.shape[0])
+
+    def make_hook(weight_name: str):
+        def hook_fn(module: nn.Module, inp: tuple[Tensor, ...], out: Tensor) -> None:
+            add_cov(weight_name, inp[0])
+        return hook_fn
+
+    for name, module in model.named_modules():
+        if isinstance(module, CastedLinear):
+            handles.append(module.register_forward_hook(make_hook(f"{name}.weight")))
+
+    if getattr(model, "tie_embeddings", False):
+        def final_norm_hook(module: nn.Module, inp: tuple[Tensor, ...], out: Tensor) -> None:
+            add_cov("tok_emb.weight", out)
+        handles.append(model.final_norm.register_forward_hook(final_norm_hook))
+
+    was_training = model.training
+    calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    model.eval()
+    with torch.inference_mode():
+        for _ in range(args.quant_ablation_calib_batches):
+            x, y = calib_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                model(x, y)
+    for handle in handles:
+        handle.remove()
+
+    if dist.is_available() and dist.is_initialized():
+        for name in sorted(covs):
+            dist.all_reduce(covs[name], op=dist.ReduceOp.SUM)
+            count_t = torch.tensor(counts[name], dtype=torch.float64, device=device)
+            dist.all_reduce(count_t, op=dist.ReduceOp.SUM)
+            counts[name] = int(count_t.item())
+    for name, cov in list(covs.items()):
+        covs[name] = (cov / max(counts[name], 1)).cpu().contiguous()
+    model.train(was_training)
+    return covs, counts
+
+
+def coquant_lowrank_factors(error: Tensor, hessian: Tensor, rank: int) -> tuple[Tensor, Tensor]:
+    err = error.float().cpu().contiguous()
+    cols = err.shape[1]
+    h = hessian.float().cpu().contiguous()
+    if h.shape != (cols, cols):
+        u, s, vh = torch.linalg.svd(err, full_matrices=False)
+        r = min(rank, s.numel())
+        return (u[:, :r] * s[:r]).contiguous(), vh[:r, :].contiguous()
+    h = 0.5 * (h + h.T)
+    evals, evecs = torch.linalg.eigh(h)
+    evals = evals.clamp_min(0.0)
+    hsqrt = (evecs * evals.sqrt().view(1, -1)) @ evecs.T
+    gram = hsqrt @ (err.T @ err) @ hsqrt
+    gram = 0.5 * (gram + gram.T)
+    _, vecs = torch.linalg.eigh(gram)
+    r = min(rank, vecs.shape[1])
+    v = hsqrt @ vecs[:, -r:]
+    v, _ = torch.linalg.qr(v, mode="reduced")
+    return (err @ v).contiguous(), v.T.contiguous()
+
+
+def lowrank_output_error_score(error: Tensor, hessian: Tensor | None) -> float:
+    err = error.float().cpu()
+    if hessian is None or hessian.shape != (err.shape[1], err.shape[1]):
+        return float(err.square().sum().item())
+    h = hessian.float().cpu()
+    return float(((err @ h) * err).sum().item())
+
+
+def build_quant_ablation_state(state_dict: dict[str, Tensor], hessians: dict[str, Tensor], method: str, args: Hyperparameters) -> tuple[dict[str, Tensor], dict[str, object]]:
+    out: dict[str, Tensor] = {}
+    stats: dict[str, object] = {
+        "payload_bytes": 0,
+        "quantized_tensors": 0,
+        "lqer_tensors": 0,
+        "top": [],
+    }
+    candidates: list[tuple[float, str, Tensor, Tensor | None]] = []
+    use_gptq = method in {"gptq", "gptq_lqer", "coquant_lqer"}
+    use_lqer = method in {"gptq_lqer", "coquant_lqer"}
+    use_coquant = method == "coquant_lqer"
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu().contiguous()
+        if not t.is_floating_point():
+            out[name] = t
+            stats["payload_bytes"] = int(stats["payload_bytes"]) + tensor_nbytes(t)
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or t.ndim != 2:
+            kept = keep_float_tensor(name, t, {})
+            out[name] = kept.to(dtype=t.dtype).contiguous()
+            stats["payload_bytes"] = int(stats["payload_bytes"]) + tensor_nbytes(kept)
+            continue
+        if use_gptq and name in hessians:
+            q, scale = gptq_quantize_weight(
+                t,
+                hessians[name],
+                args.quant_ablation_bits,
+                args.quant_ablation_clip_sigmas,
+                args.quant_ablation_gptq_damp,
+                args.quant_ablation_gptq_block_size,
+            )
+        else:
+            q, scale = quantize_weight_symmetric(t, args.quant_ablation_bits, None)
+        deq = dequantize_weight_symmetric(q, scale, t.dtype)
+        out[name] = deq
+        stats["quantized_tensors"] = int(stats["quantized_tensors"]) + 1
+        stats["payload_bytes"] = int(stats["payload_bytes"]) + tensor_nbytes(q) + tensor_nbytes(scale)
+        if use_lqer and name in hessians:
+            error = t.float() - deq.float()
+            score = lowrank_output_error_score(error, hessians.get(name)) if use_coquant else float(error.norm().item())
+            candidates.append((score, name, error, hessians.get(name)))
+
+    if use_lqer and candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for score, name, error, hessian in candidates[: args.quant_ablation_lqer_top_k]:
+            if use_coquant and hessian is not None:
+                a, b = coquant_lowrank_factors(error, hessian, args.quant_ablation_lqer_rank)
+            else:
+                u, s, vh = torch.linalg.svd(error.float(), full_matrices=False)
+                r = min(args.quant_ablation_lqer_rank, s.numel())
+                a, b = (u[:, :r] * s[:r]).contiguous(), vh[:r, :].contiguous()
+            qa, sa = pack_lowrank_factor(a, args.quant_ablation_lqer_factor_bits)
+            qb, sb = pack_lowrank_factor(b, args.quant_ablation_lqer_factor_bits)
+            correction = unpack_lowrank_factor(qa, sa) @ unpack_lowrank_factor(qb, sb)
+            out[name] = (out[name].float() + correction).to(dtype=state_dict[name].dtype).contiguous()
+            stats["payload_bytes"] = int(stats["payload_bytes"]) + tensor_nbytes(qa) + tensor_nbytes(sa) + tensor_nbytes(qb) + tensor_nbytes(sb)
+            stats["lqer_tensors"] = int(stats["lqer_tensors"]) + 1
+            cast_top = stats["top"]
+            assert isinstance(cast_top, list)
+            cast_top.append((name, float(score)))
+    return out, stats
+
+
+def run_quant_ablation(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    model: nn.Module,
+    original_state: dict[str, Tensor],
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    log0,
+) -> None:
+    log0(
+        "quant_ablation:enabled "
+        f"methods:{','.join(args.quant_ablation_methods)} bits:{args.quant_ablation_bits} "
+        f"calib_batches:{args.quant_ablation_calib_batches} "
+        f"rank:{args.quant_ablation_lqer_rank} top_k:{args.quant_ablation_lqer_top_k}"
+    )
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    hessians, counts = collect_linear_input_covariances(base_model, args, rank, world_size, device, grad_accum_steps)
+    torch.cuda.synchronize()
+    count_min = min(counts.values()) if counts else 0
+    count_max = max(counts.values()) if counts else 0
+    log0(
+        f"quant_ablation:calibration tensors:{len(hessians)} "
+        f"rows_min:{count_min} rows_max:{count_max} time:{1000.0 * (time.perf_counter() - t0):.0f}ms"
+    )
+
+    for method in args.quant_ablation_methods:
+        if method == "int8":
+            quant_obj, quant_stats = quantize_state_dict_int8(original_state)
+            roundtrip_state = dequantize_state_dict_int8(quant_obj)
+            stats: dict[str, object] = {
+                "payload_bytes": quant_stats["int8_payload_bytes"],
+                "quantized_tensors": quant_stats["num_float_tensors"],
+                "lqer_tensors": 0,
+                "top": [],
+            }
+        elif method in {"row", "gptq", "gptq_lqer", "coquant_lqer"}:
+            roundtrip_state, stats = build_quant_ablation_state(original_state, hessians, method, args)
+        else:
+            log0(f"quant_ablation:skip unknown_method:{method}")
+            continue
+
+        base_model.load_state_dict(roundtrip_state, strict=True)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        torch.cuda.synchronize()
+        t_eval = time.perf_counter()
+        val_loss, val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        top = stats.get("top", [])
+        if isinstance(top, list) and top:
+            top_str = ",".join(f"{name}:{score:.3e}" for name, score in top[:5])
+            log0(f"quant_ablation_top method:{method} {top_str}")
+        log0(
+            f"quant_ablation_result method:{method} val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f} "
+            f"payload_bytes:{int(stats['payload_bytes'])} quantized_tensors:{int(stats['quantized_tensors'])} "
+            f"lqer_tensors:{int(stats['lqer_tensors'])} eval_time:{1000.0 * (time.perf_counter() - t_eval):.0f}ms"
+        )
+        base_model.load_state_dict(original_state, strict=True)
 
 
 # -----------------------------
@@ -1072,6 +1420,25 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+    original_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+    if args.quant_ablation:
+        run_quant_ablation(
+            args,
+            base_model,
+            model,
+            original_state,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log0,
+        )
+        base_model.load_state_dict(original_state, strict=True)
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
