@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import heapq
 import io
 import math
 import os
@@ -15,6 +16,7 @@ import random
 import resource
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import zlib
@@ -87,22 +89,16 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    # Mudskipper v1: CPU-side online data triage. Disabled gives the copied
-    # baseline loader exactly; enabled mildly biases a small slice of windows.
-    mudskipper_scout = bool(int(os.environ.get("MUDSKIPPER_SCOUT", "1")))
-    mudskipper_scout_fraction = float(os.environ.get("MUDSKIPPER_SCOUT_FRACTION", 0.125))
-    mudskipper_candidate_mult = float(os.environ.get("MUDSKIPPER_CANDIDATE_MULT", 1.25))
-    mudskipper_vocab_size = int(os.environ.get("MUDSKIPPER_VOCAB_SIZE", vocab_size))
+    # Mudskipper v3: async CPU scanner + bucketed priority reservoir.
+    # This starts from the baseline training loop and does not use v2 feedback.
+    mudskipper_async = bool(int(os.environ.get("MUDSKIPPER_ASYNC", "1")))
+    mudskipper_priority_fraction = float(os.environ.get("MUDSKIPPER_PRIORITY_FRACTION", 0.125))
+    mudskipper_scan_batch = int(os.environ.get("MUDSKIPPER_SCAN_BATCH", 128))
     mudskipper_bucket_count = int(os.environ.get("MUDSKIPPER_BUCKET_COUNT", 64))
+    mudskipper_bucket_capacity = int(os.environ.get("MUDSKIPPER_BUCKET_CAPACITY", 32))
     mudskipper_recent_hashes = int(os.environ.get("MUDSKIPPER_RECENT_HASHES", 8192))
     mudskipper_log_every = int(os.environ.get("MUDSKIPPER_LOG_EVERY", train_log_every))
-    mudskipper_nvidia_smi = bool(int(os.environ.get("MUDSKIPPER_NVIDIA_SMI", "0")))
-    mudskipper_feedback = bool(int(os.environ.get("MUDSKIPPER_FEEDBACK", "1")))
-    mudskipper_feedback_every = int(os.environ.get("MUDSKIPPER_FEEDBACK_EVERY", 1))
-    mudskipper_feedback_weight = float(os.environ.get("MUDSKIPPER_FEEDBACK_WEIGHT", 0.45))
-    mudskipper_reward_ema = float(os.environ.get("MUDSKIPPER_REWARD_EMA", 0.04))
-    mudskipper_reward_clip = float(os.environ.get("MUDSKIPPER_REWARD_CLIP", 0.35))
-    mudskipper_reward_warmup = int(os.environ.get("MUDSKIPPER_REWARD_WARMUP", 32))
+    mudskipper_min_score = float(os.environ.get("MUDSKIPPER_MIN_SCORE", -0.15))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -492,34 +488,23 @@ class TokenStream:
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
     def take_windows(self, num_windows: int, seq_len: int) -> list[Tensor]:
-        # Contiguous non-overlapping x windows with the usual +1 target token.
-        # Window i starts at i * seq_len in the consumed token block.
         if num_windows <= 0:
             return []
         block = self.take(num_windows * seq_len + 1)
         return [block[i * seq_len : i * seq_len + seq_len + 1] for i in range(num_windows)]
 
 
-class MudskipperScout:
+class MudskipperPageScorer:
     def __init__(self, args: Hyperparameters):
-        self.vocab_size = max(int(args.mudskipper_vocab_size), 2)
+        self.vocab_size = max(int(args.vocab_size), 2)
         self.bucket_count = max(int(args.mudskipper_bucket_count), 1)
         self.recent_hash_limit = max(int(args.mudskipper_recent_hashes), 0)
-        self.feedback_weight = float(args.mudskipper_feedback_weight)
-        self.reward_alpha = min(max(float(args.mudskipper_reward_ema), 0.0), 1.0)
-        self.reward_clip = max(float(args.mudskipper_reward_clip), 1e-6)
-        self.reward_warmup = max(int(args.mudskipper_reward_warmup), 1)
         self.counts = np.ones(self.vocab_size, dtype=np.float64)
         self.total = float(self.vocab_size)
-        self.bucket_seen = np.ones(self.bucket_count, dtype=np.float64)
-        self.bucket_reward = np.zeros(self.bucket_count, dtype=np.float64)
-        self.bucket_feedback = np.zeros(self.bucket_count, dtype=np.int64)
-        self.global_loss_ema = 0.0
-        self.feedback_updates = 0
         self.recent_hashes: dict[int, None] = {}
         self.unique_thresholds = np.array([0.08, 0.16, 0.32])
 
-    def _token_array(self, window: Tensor) -> np.ndarray:
+    def _arr(self, window: Tensor) -> np.ndarray:
         arr = window[:-1].numpy().astype(np.int64, copy=False)
         if arr.size == 0:
             return arr
@@ -530,8 +515,8 @@ class MudskipperScout:
             return 0
         stride = max(1, arr.size // 64)
         h = 1469598103934665603
-        for v in arr[::stride][:64].tolist():
-            h ^= int(v) + 0x9E3779B97F4A7C15
+        for token in arr[::stride][:64].tolist():
+            h ^= int(token) + 0x9E3779B97F4A7C15
             h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
         return h
 
@@ -544,11 +529,11 @@ class MudskipperScout:
         token_bin = min(3, max(0, int(token_level * 4.0)))
         return int((rare_bin * 16 + unique_bin * 4 + token_bin) % self.bucket_count)
 
-    def score_windows(self, windows: list[Tensor]) -> list[tuple[float, int, bool, int]]:
-        rows: list[dict[str, float | int | bool]] = []
+    def score_batch(self, windows: list[Tensor]) -> list[tuple[float, int, bool]]:
+        rows: list[dict[str, float | int | bool | np.ndarray]] = []
         nlls = np.empty(len(windows), dtype=np.float64)
         for i, window in enumerate(windows):
-            arr = self._token_array(window)
+            arr = self._arr(window)
             if arr.size == 0:
                 nll = math.log(self.vocab_size)
                 unique_ratio = 0.0
@@ -559,107 +544,220 @@ class MudskipperScout:
                 probs = self.counts[arr] / self.total
                 nll = float(-np.log(probs + 1e-12).mean())
                 binc = np.bincount(arr, minlength=self.vocab_size)
-                unique = int(np.count_nonzero(binc))
-                unique_ratio = unique / float(arr.size)
+                unique_ratio = float(np.count_nonzero(binc)) / float(arr.size)
                 max_frac = float(binc.max()) / float(arr.size)
                 repeat_frac = float(np.mean(arr[1:] == arr[:-1])) if arr.size > 1 else 0.0
                 rare_frac = float(np.mean(self.counts[arr] <= 2.0))
-            bucket = self._bucket(arr, rare_frac, unique_ratio)
             fp = self._fingerprint(arr)
-            recent_hit = fp in self.recent_hashes
+            bucket = self._bucket(arr, rare_frac, unique_ratio)
             junk = unique_ratio < 0.04 or max_frac > 0.45 or repeat_frac > 0.35
             rows.append(
                 {
                     "idx": i,
+                    "arr": arr,
                     "nll": nll,
+                    "rare_frac": rare_frac,
                     "unique_ratio": unique_ratio,
                     "max_frac": max_frac,
                     "repeat_frac": repeat_frac,
-                    "rare_frac": rare_frac,
+                    "recent_hit": fp in self.recent_hashes,
                     "bucket": bucket,
-                    "fp": fp,
-                    "recent_hit": recent_hit,
                     "junk": junk,
+                    "fp": fp,
                 }
             )
             nlls[i] = nll
 
-        if len(rows) == 0:
+        if not rows:
             return []
         order = np.argsort(nlls)
         ranks = np.empty(len(rows), dtype=np.float64)
         ranks[order] = np.linspace(0.0, 1.0, num=len(rows), endpoint=True) if len(rows) > 1 else 0.5
-        out: list[tuple[float, int, bool, int]] = []
+        scored: list[tuple[float, int, bool]] = []
         for row in rows:
             idx = int(row["idx"])
-            # Prefer medium-high CPU surprise, not the extreme tail.
             surprise = max(0.0, 1.0 - abs(float(ranks[idx]) - 0.70) / 0.70)
-            bucket = int(row["bucket"])
-            coverage = 1.0 / math.sqrt(float(self.bucket_seen[bucket]))
-            feedback_conf = min(1.0, float(self.bucket_feedback[bucket]) / float(self.reward_warmup))
-            feedback_bonus = self.feedback_weight * feedback_conf * float(self.bucket_reward[bucket])
             score = (
-                0.65 * surprise
-                + 0.20 * float(row["rare_frac"])
-                + 0.15 * coverage
-                + feedback_bonus
-                - 0.35 * float(row["max_frac"])
-                - 0.25 * float(row["repeat_frac"])
+                0.62 * surprise
+                + 0.18 * float(row["rare_frac"])
+                + 0.12 * float(row["unique_ratio"])
+                - 0.22 * float(row["max_frac"])
+                - 0.20 * float(row["repeat_frac"])
             )
             if bool(row["recent_hit"]):
                 score -= 0.25
             if bool(row["junk"]):
                 score -= 1.0
-            out.append((score, bucket, bool(row["junk"]), int(row["fp"])))
-        return out
+            scored.append((float(score), int(row["bucket"]), bool(row["junk"])))
 
-    def update(self, windows: list[Tensor], scored: list[tuple[float, int, bool, int]]) -> None:
-        for window, (_, bucket, _, fp) in zip(windows, scored, strict=True):
-            arr = self._token_array(window)
-            if arr.size:
+            arr = row["arr"]
+            if isinstance(arr, np.ndarray) and arr.size:
                 self.counts += np.bincount(arr, minlength=self.vocab_size)
                 self.total += float(arr.size)
-            self.bucket_seen[bucket] += 1.0
+            fp = int(row["fp"])
             if self.recent_hash_limit > 0:
                 self.recent_hashes[fp] = None
                 while len(self.recent_hashes) > self.recent_hash_limit:
                     self.recent_hashes.pop(next(iter(self.recent_hashes)))
+        return scored
 
-    def update_feedback(self, scored: list[tuple[float, int, bool, int]], losses: np.ndarray) -> None:
-        if losses.size == 0 or not scored:
+
+class AsyncPriorityReservoir:
+    def __init__(self, pattern: str, seq_len: int, args: Hyperparameters):
+        self.stream = TokenStream(pattern)
+        self.seq_len = seq_len
+        self.scan_batch = max(int(args.mudskipper_scan_batch), 1)
+        self.bucket_count = max(int(args.mudskipper_bucket_count), 1)
+        self.bucket_capacity = max(int(args.mudskipper_bucket_capacity), 1)
+        self.min_score = float(args.mudskipper_min_score)
+        self.scorer = MudskipperPageScorer(args)
+        self.heaps: list[list[tuple[float, int, Tensor]]] = [[] for _ in range(self.bucket_count)]
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.counter = 0
+        self.fill = 0
+        self.stats = {
+            "scanned": 0,
+            "pushed": 0,
+            "replaced": 0,
+            "rejected": 0,
+            "popped": 0,
+            "empty": 0,
+            "scan_ms": 0.0,
+            "lock_ms": 0.0,
+        }
+
+    def start(self) -> None:
+        if self.thread is not None:
             return
-        losses = losses.astype(np.float64, copy=False)
-        batch_loss = float(np.mean(losses))
-        if self.global_loss_ema <= 0.0:
-            self.global_loss_ema = batch_loss
-        else:
-            self.global_loss_ema = (1.0 - self.reward_alpha) * self.global_loss_ema + self.reward_alpha * batch_loss
-        denom = max(self.global_loss_ema, 1e-6)
-        rel = np.clip(losses / denom - 1.0, -self.reward_clip, self.reward_clip)
-        bucket_sum = np.zeros(self.bucket_count, dtype=np.float64)
-        bucket_count = np.zeros(self.bucket_count, dtype=np.int64)
-        for (_, bucket, junk, _), value in zip(scored, rel, strict=False):
-            if junk:
-                continue
-            bucket_sum[bucket] += float(value)
-            bucket_count[bucket] += 1
-        for bucket in np.nonzero(bucket_count)[0].tolist():
-            bucket_mean = bucket_sum[bucket] / float(bucket_count[bucket])
-            self.bucket_reward[bucket] = (1.0 - self.reward_alpha) * self.bucket_reward[bucket] + self.reward_alpha * bucket_mean
-            self.bucket_feedback[bucket] += int(bucket_count[bucket])
-        self.feedback_updates += 1
+        self.thread = threading.Thread(target=self._run, name="mudskipper-reservoir", daemon=True)
+        self.thread.start()
 
-    def reward_line(self) -> str:
-        if self.bucket_count <= 0:
-            return "reward:na"
-        best = np.argsort(self.bucket_reward)[-3:][::-1]
-        worst = np.argsort(self.bucket_reward)[:3]
-        best_s = ",".join(f"{int(i)}:{self.bucket_reward[i]:+.3f}/{int(self.bucket_feedback[i])}" for i in best)
-        worst_s = ",".join(f"{int(i)}:{self.bucket_reward[i]:+.3f}/{int(self.bucket_feedback[i])}" for i in worst)
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+            self.thread = None
+
+    def _run(self) -> None:
+        high_water = self.bucket_count * self.bucket_capacity
+        while not self.stop_event.is_set():
+            if self.fill >= high_water:
+                time.sleep(0.001)
+                continue
+            t0 = time.perf_counter()
+            windows = self.stream.take_windows(self.scan_batch, self.seq_len)
+            scored = self.scorer.score_batch(windows)
+            scan_ms = 1000.0 * (time.perf_counter() - t0)
+            t_lock = time.perf_counter()
+            with self.lock:
+                self.stats["scan_ms"] += scan_ms
+                for window, (score, bucket, junk) in zip(windows, scored, strict=True):
+                    self.stats["scanned"] += 1
+                    if junk or score < self.min_score:
+                        self.stats["rejected"] += 1
+                        continue
+                    bucket = bucket % self.bucket_count
+                    heap = self.heaps[bucket]
+                    fill_bonus = 0.10 * (1.0 - min(len(heap) / float(self.bucket_capacity), 1.0))
+                    item = (score + fill_bonus, self.counter, window.clone())
+                    self.counter += 1
+                    if len(heap) < self.bucket_capacity:
+                        heapq.heappush(heap, item)
+                        self.fill += 1
+                        self.stats["pushed"] += 1
+                    elif item[0] > heap[0][0]:
+                        heapq.heapreplace(heap, item)
+                        self.stats["replaced"] += 1
+                    else:
+                        self.stats["rejected"] += 1
+                self.stats["lock_ms"] += 1000.0 * (time.perf_counter() - t_lock)
+
+    def pop_many(self, n: int) -> list[Tensor]:
+        if n <= 0:
+            return []
+        out: list[Tensor] = []
+        used = np.zeros(self.bucket_count, dtype=np.int64)
+        with self.lock:
+            for _ in range(n):
+                best_bucket = -1
+                best_idx = -1
+                best_score = -float("inf")
+                for bucket, heap in enumerate(self.heaps):
+                    if not heap:
+                        continue
+                    idx, item = max(enumerate(heap), key=lambda x: x[1][0])
+                    adjusted = item[0] - 0.08 * float(used[bucket])
+                    if adjusted > best_score:
+                        best_score = adjusted
+                        best_bucket = bucket
+                        best_idx = idx
+                if best_bucket < 0:
+                    self.stats["empty"] += n - len(out)
+                    break
+                heap = self.heaps[best_bucket]
+                score, counter, window = heap[best_idx]
+                last = heap.pop()
+                if best_idx < len(heap):
+                    heap[best_idx] = last
+                    heapq.heapify(heap)
+                self.fill -= 1
+                self.stats["popped"] += 1
+                used[best_bucket] += 1
+                out.append(window)
+        return out
+
+    def stats_line(self, reset: bool = False) -> str:
+        with self.lock:
+            stats = self.stats.copy()
+            fill = self.fill
+            nonempty = sum(1 for heap in self.heaps if heap)
+            top = sorted(
+                ((max(heap, key=lambda x: x[0])[0] if heap else -999.0, i, len(heap)) for i, heap in enumerate(self.heaps)),
+                reverse=True,
+            )[:3]
+            if reset:
+                for key in self.stats:
+                    self.stats[key] = 0.0 if key.endswith("_ms") else 0
+        top_s = ",".join(f"{bucket}:{size}" for _, bucket, size in top if size > 0)
+        scanned = max(int(stats["scanned"]), 1)
         return (
-            f"reward_updates:{self.feedback_updates} global_loss_ema:{self.global_loss_ema:.4f} "
-            f"reward_best:{best_s} reward_worst:{worst_s}"
+            f"reservoir fill:{fill} nonempty:{nonempty}/{self.bucket_count} "
+            f"scanned:{int(stats['scanned'])} pushed:{int(stats['pushed'])} replaced:{int(stats['replaced'])} "
+            f"popped:{int(stats['popped'])} rejected:{int(stats['rejected'])} empty:{int(stats['empty'])} "
+            f"scan_ms/window:{stats['scan_ms'] / scanned:.3f} lock_ms:{stats['lock_ms']:.1f} top:{top_s}"
         )
+
+
+class ResourceMonitor:
+    def __init__(self, device: torch.device):
+        self.device = device
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        self.last_wall = time.perf_counter()
+        self.last_cpu = ru.ru_utime + ru.ru_stime
+
+    def line(self) -> str:
+        now = time.perf_counter()
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        cpu_time = ru.ru_utime + ru.ru_stime
+        dt = max(now - self.last_wall, 1e-9)
+        cpu_dt = max(cpu_time - self.last_cpu, 0.0)
+        self.last_wall = now
+        self.last_cpu = cpu_time
+        load = "load:na"
+        try:
+            load1, load5, load15 = os.getloadavg()
+            load = f"load:{load1:.2f}/{load5:.2f}/{load15:.2f}"
+        except OSError:
+            pass
+        try:
+            cuda_util = f"cuda_util:{torch.cuda.utilization(self.device)}%"
+        except Exception:
+            cuda_util = "cuda_util:na"
+        alloc = torch.cuda.memory_allocated(self.device) // 1024 // 1024
+        reserved = torch.cuda.memory_reserved(self.device) // 1024 // 1024
+        return f"resources proc_cpu:{100.0 * cpu_dt / dt:.1f}% {load} {cuda_util} cuda_mem:{alloc}MiB cuda_reserved:{reserved}MiB"
 
 
 class DistributedTokenLoader:
@@ -671,27 +769,18 @@ class DistributedTokenLoader:
         self.device = device
         self.stream = TokenStream(pattern)
         self.args = args
-        self.scout_enabled = bool(args is not None and args.mudskipper_scout)
-        self.scout_fraction = 0.0 if args is None else min(max(float(args.mudskipper_scout_fraction), 0.0), 0.95)
-        self.candidate_mult = 1.0 if args is None else max(float(args.mudskipper_candidate_mult), 1.0)
-        self.scout = MudskipperScout(args) if self.scout_enabled else None
-        self.pending_feedback: list[tuple[float, int, bool, int]] = []
-        self.stats = {
-            "batches": 0,
-            "candidates": 0,
-            "accepted_base": 0,
-            "accepted_scout": 0,
-            "skipped": 0,
-            "junk_candidates": 0,
-            "feedback": 0,
-            "stream_ms": 0.0,
-            "score_ms": 0.0,
-            "update_ms": 0.0,
-            "feedback_ms": 0.0,
-            "h2d_ms": 0.0,
-        }
+        self.async_enabled = bool(args is not None and args.mudskipper_async)
+        self.priority_fraction = 0.0 if args is None else min(max(float(args.mudskipper_priority_fraction), 0.0), 0.5)
+        self.reservoir = AsyncPriorityReservoir(pattern, args.train_seq_len, args) if self.async_enabled and args is not None else None
+        self.stats = {"batches": 0, "priority": 0, "fallback": 0, "dropped": 0, "h2d_ms": 0.0}
+        if self.reservoir is not None:
+            self.reservoir.start()
 
-    def _next_baseline_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+    def close(self) -> None:
+        if self.reservoir is not None:
+            self.reservoir.close()
+
+    def _baseline_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
@@ -699,7 +788,6 @@ class DistributedTokenLoader:
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
-        self.pending_feedback = []
         t_h2d = time.perf_counter()
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
@@ -707,162 +795,42 @@ class DistributedTokenLoader:
         self.stats["batches"] += 1
         return x, y
 
-    def _next_scout_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
-        assert self.scout is not None
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        if not self.async_enabled or self.reservoir is None:
+            return self._baseline_batch(global_tokens, seq_len, grad_accum_steps)
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         num_seqs = local_tokens // seq_len
         global_num_seqs = num_seqs * self.world_size
-        scout_take = int(round(global_num_seqs * self.scout_fraction))
-        scout_take = min(max(scout_take, 0), max(global_num_seqs - 1, 0))
-        base_take = global_num_seqs - scout_take
-        if scout_take == 0:
-            candidate_count = global_num_seqs
-        else:
-            candidate_count = max(global_num_seqs + scout_take, int(math.ceil(global_num_seqs * self.candidate_mult)))
-
-        t_stream = time.perf_counter()
-        candidates = self.stream.take_windows(candidate_count, seq_len)
-        self.stats["stream_ms"] += 1000.0 * (time.perf_counter() - t_stream)
-
-        accepted: list[tuple[int, Tensor, tuple[float, int, bool, int]]] = []
-        base_windows = candidates[:base_take]
-        if base_windows:
-            t_score_base = time.perf_counter()
-            base_scores = self.scout.score_windows(base_windows)
-            self.stats["score_ms"] += 1000.0 * (time.perf_counter() - t_score_base)
-            accepted.extend((i, w, s) for i, (w, s) in enumerate(zip(base_windows, base_scores, strict=True)))
-        if scout_take > 0:
-            pool = candidates[base_take:]
-            t_score = time.perf_counter()
-            scored_pool = self.scout.score_windows(pool)
-            self.stats["score_ms"] += 1000.0 * (time.perf_counter() - t_score)
-            ranked = sorted(range(len(pool)), key=lambda i: scored_pool[i][0], reverse=True)
-            selected = sorted(ranked[:scout_take])
-            accepted.extend((base_take + i, pool[i], scored_pool[i]) for i in selected)
-            self.stats["junk_candidates"] += sum(1 for _, _, junk, _ in scored_pool if junk)
-        accepted.sort(key=lambda x: x[0])
-        accepted_windows = [w for _, w, _ in accepted]
-        accepted_scores = [s for _, _, s in accepted]
-
-        t_update = time.perf_counter()
-        self.scout.update(accepted_windows, accepted_scores)
-        self.stats["update_ms"] += 1000.0 * (time.perf_counter() - t_update)
-
-        local_windows = accepted_windows[self.rank::self.world_size]
-        self.pending_feedback = accepted_scores[self.rank::self.world_size]
+        priority_target = int(round(global_num_seqs * self.priority_fraction))
+        priority_windows = self.reservoir.pop_many(priority_target)
+        fallback = priority_target - len(priority_windows)
+        normal_windows = self.stream.take_windows(global_num_seqs, seq_len)
+        base_take = global_num_seqs - len(priority_windows)
+        accepted = normal_windows[:base_take] + priority_windows
+        local_windows = accepted[self.rank::self.world_size]
         x_cpu = torch.stack([w[:-1].to(dtype=torch.int64) for w in local_windows])
         y_cpu = torch.stack([w[1:].to(dtype=torch.int64) for w in local_windows])
         t_h2d = time.perf_counter()
         x = x_cpu.to(self.device, non_blocking=True)
         y = y_cpu.to(self.device, non_blocking=True)
         self.stats["h2d_ms"] += 1000.0 * (time.perf_counter() - t_h2d)
-
         self.stats["batches"] += 1
-        self.stats["candidates"] += candidate_count
-        self.stats["accepted_base"] += base_take
-        self.stats["accepted_scout"] += scout_take
-        self.stats["skipped"] += max(0, candidate_count - global_num_seqs)
+        self.stats["priority"] += len(priority_windows)
+        self.stats["fallback"] += fallback
+        self.stats["dropped"] += len(priority_windows)
         return x, y
-
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
-        if self.scout_enabled:
-            return self._next_scout_batch(global_tokens, seq_len, grad_accum_steps)
-        return self._next_baseline_batch(global_tokens, seq_len, grad_accum_steps)
-
-    def observe_losses(self, per_sequence_loss: Tensor) -> None:
-        if self.scout is None or not self.pending_feedback:
-            return
-        t_feedback = time.perf_counter()
-        losses = per_sequence_loss.detach().float().cpu().numpy()
-        n = min(len(self.pending_feedback), int(losses.shape[0]))
-        self.scout.update_feedback(self.pending_feedback[:n], losses[:n])
-        self.stats["feedback"] += n
-        self.stats["feedback_ms"] += 1000.0 * (time.perf_counter() - t_feedback)
-        self.pending_feedback = []
 
     def stats_line(self, reset: bool = False) -> str:
         s = self.stats.copy()
         batches = max(int(s["batches"]), 1)
-        reward = "" if self.scout is None else " " + self.scout.reward_line()
-        line = (
-            f"mudskipper scout:{int(self.scout_enabled)} batches:{int(s['batches'])} "
-            f"cand:{int(s['candidates'])} base:{int(s['accepted_base'])} "
-            f"scout:{int(s['accepted_scout'])} skipped:{int(s['skipped'])} "
-            f"junk:{int(s['junk_candidates'])} feedback:{int(s['feedback'])} "
-            f"stream_ms/b:{s['stream_ms'] / batches:.2f} score_ms/b:{s['score_ms'] / batches:.2f} "
-            f"update_ms/b:{s['update_ms'] / batches:.2f} feedback_ms/b:{s['feedback_ms'] / batches:.2f} "
-            f"h2d_ms/b:{s['h2d_ms'] / batches:.2f}{reward}"
-        )
         if reset:
             for key in self.stats:
                 self.stats[key] = 0.0 if key.endswith("_ms") else 0
-        return line
-
-class ResourceMonitor:
-    def __init__(self, args: Hyperparameters, device: torch.device, local_rank: int):
-        self.args = args
-        self.device = device
-        self.local_rank = local_rank
-        ru = resource.getrusage(resource.RUSAGE_SELF)
-        self.last_wall = time.perf_counter()
-        self.last_cpu = ru.ru_utime + ru.ru_stime
-
-    def _rss_mib(self, raw: int) -> float:
-        # macOS reports bytes; Linux reports KiB.
-        return raw / (1024.0 * 1024.0) if sys.platform == "darwin" else raw / 1024.0
-
-    def _nvidia_smi_line(self) -> str:
-        if not self.args.mudskipper_nvidia_smi:
-            return "gpu_smi:off"
-        cmd = [
-            "nvidia-smi",
-            "-i",
-            str(self.local_rank),
-            "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,temperature.gpu",
-            "--format=csv,noheader,nounits",
-        ]
-        try:
-            out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=0.35, check=False)
-        except Exception as exc:
-            return f"gpu_smi:err:{type(exc).__name__}"
-        line = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
-        if not line:
-            return "gpu_smi:na"
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 6:
-            return f"gpu_smi:{line}"
+        reservoir = "" if self.reservoir is None else " " + self.reservoir.stats_line(reset=reset)
         return (
-            f"gpu_util:{parts[0]}% gpu_mem_util:{parts[1]}% "
-            f"gpu_mem:{parts[2]}/{parts[3]}MiB gpu_power:{parts[4]}W gpu_temp:{parts[5]}C"
-        )
-
-    def snapshot_line(self) -> str:
-        now = time.perf_counter()
-        ru = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_time = ru.ru_utime + ru.ru_stime
-        dt = max(now - self.last_wall, 1e-9)
-        cpu_dt = max(cpu_time - self.last_cpu, 0.0)
-        self.last_wall = now
-        self.last_cpu = cpu_time
-        cpu_pct_one_core = 100.0 * cpu_dt / dt
-        cpu_pct_total = cpu_pct_one_core / max(os.cpu_count() or 1, 1)
-        try:
-            load1, load5, load15 = os.getloadavg()
-            load = f"load:{load1:.2f}/{load5:.2f}/{load15:.2f}"
-        except OSError:
-            load = "load:na"
-        alloc = torch.cuda.memory_allocated(self.device) // 1024 // 1024
-        reserved = torch.cuda.memory_reserved(self.device) // 1024 // 1024
-        peak = torch.cuda.max_memory_allocated(self.device) // 1024 // 1024
-        try:
-            cuda_util = f"cuda_util:{torch.cuda.utilization(self.device)}%"
-        except Exception:
-            cuda_util = "cuda_util:na"
-        rss = self._rss_mib(int(ru.ru_maxrss))
-        return (
-            f"resources proc_cpu:{cpu_pct_one_core:.1f}% total_cpu:{cpu_pct_total:.1f}% "
-            f"rss_peak:{rss:.0f}MiB {load} cuda_mem:{alloc}MiB "
-            f"cuda_reserved:{reserved}MiB cuda_peak:{peak}MiB {cuda_util} {self._nvidia_smi_line()}"
+            f"mudskipper_async:{int(self.async_enabled)} batches:{int(s['batches'])} "
+            f"priority:{int(s['priority'])} fallback:{int(s['fallback'])} dropped:{int(s['dropped'])} "
+            f"h2d_ms/b:{s['h2d_ms'] / batches:.2f}{reservoir}"
         )
 
 # -----------------------------
@@ -1069,7 +1037,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, return_per_sequence_loss: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1093,11 +1061,6 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        if return_per_sequence_loss:
-            per_token_loss = F.cross_entropy(logits.float(), targets, reduction="none")
-            loss = per_token_loss.mean()
-            per_sequence_loss = per_token_loss.view(input_ids.size(0), input_ids.size(1)).mean(dim=1)
-            return loss, per_sequence_loss.detach()
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1160,7 +1123,7 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
-    resource_monitor = ResourceMonitor(args, device, local_rank)
+    resource_monitor = ResourceMonitor(device)
 
     log0(code, console=False)
     log0("=" * 100, console=False)
@@ -1287,14 +1250,9 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"mudskipper_scout:{args.mudskipper_scout} scout_fraction:{args.mudskipper_scout_fraction:.4f} "
-        f"candidate_mult:{args.mudskipper_candidate_mult:.3f} bucket_count:{args.mudskipper_bucket_count} "
-        f"recent_hashes:{args.mudskipper_recent_hashes} nvidia_smi:{args.mudskipper_nvidia_smi}"
-    )
-    log0(
-        f"mudskipper_feedback:{args.mudskipper_feedback} feedback_every:{args.mudskipper_feedback_every} "
-        f"feedback_weight:{args.mudskipper_feedback_weight:.3f} reward_ema:{args.mudskipper_reward_ema:.3f} "
-        f"reward_clip:{args.mudskipper_reward_clip:.3f} reward_warmup:{args.mudskipper_reward_warmup}"
+        f"mudskipper_async:{args.mudskipper_async} priority_fraction:{args.mudskipper_priority_fraction:.4f} "
+        f"scan_batch:{args.mudskipper_scan_batch} bucket_count:{args.mudskipper_bucket_count} "
+        f"bucket_capacity:{args.mudskipper_bucket_capacity} min_score:{args.mudskipper_min_score:.3f}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1309,14 +1267,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-
-    def wants_feedback(step: int) -> bool:
-        return (
-            args.mudskipper_scout
-            and args.mudskipper_feedback
-            and args.mudskipper_feedback_every > 0
-            and step % args.mudskipper_feedback_every == 0
-        )
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1342,10 +1292,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    if wants_feedback(warmup_step):
-                        warmup_loss, _ = model(x, y, True)
-                    else:
-                        warmup_loss = model(x, y)
+                    warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1358,6 +1305,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
+        train_loader.close()
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, args)
 
     # -----------------------------
@@ -1393,7 +1341,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            log0(resource_monitor.snapshot_line())
+            log0(resource_monitor.line())
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1413,16 +1361,10 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            collect_feedback = wants_feedback(step)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                if collect_feedback:
-                    loss, per_sequence_loss = model(x, y, True)
-                else:
-                    loss = model(x, y)
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
-            if collect_feedback:
-                train_loader.observe_losses(per_sequence_loss)
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1443,7 +1385,10 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
-            (args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None))
+            (
+                args.train_log_every > 0
+                and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
+            )
             or (
                 args.mudskipper_log_every > 0
                 and (step <= 10 or step % args.mudskipper_log_every == 0 or stop_after_step is not None)
@@ -1455,7 +1400,7 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
             log0(train_loader.stats_line(reset=True))
-            log0(resource_monitor.snapshot_line())
+            log0(resource_monitor.line())
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1465,6 +1410,8 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    train_loader.close()
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
