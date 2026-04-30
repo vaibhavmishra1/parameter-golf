@@ -80,6 +80,7 @@ class Hyperparameters:
     hyperloop_start = int(os.environ.get("HYPERLOOP_START", max(1, num_layers // 3)))
     hyperloop_end = int(os.environ.get("HYPERLOOP_END", min(num_layers - 2, hyperloop_start + 2)))
     hyperloop_pos_emb = bool(int(os.environ.get("HYPERLOOP_POS_EMB", "1")))
+    hyperloop_unet_skips = bool(int(os.environ.get("HYPERLOOP_UNET_SKIPS", "1")))
     hyperloop_init_res_bias = float(os.environ.get("HYPERLOOP_INIT_RES_BIAS", -5.0))
     hyperloop_init_alpha = float(os.environ.get("HYPERLOOP_INIT_ALPHA", 0.1))
 
@@ -764,6 +765,7 @@ class GPT(nn.Module):
         hyperloop_start: int,
         hyperloop_end: int,
         hyperloop_pos_emb: bool,
+        hyperloop_unet_skips: bool,
         hyperloop_init_res_bias: float,
         hyperloop_init_alpha: float,
     ):
@@ -788,11 +790,23 @@ class GPT(nn.Module):
         self.hyperloop_num_loops = hyperloop_num_loops
         self.hyperloop_start = hyperloop_start
         self.hyperloop_end = hyperloop_end
+        self.hyperloop_unet_skips = hyperloop_unet_skips
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = 0 if hyperloop_enabled else min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        if hyperloop_enabled:
+            hyperloop_end_layers = num_layers - hyperloop_end - 1
+            self.num_skip_weights = min(hyperloop_start, hyperloop_end_layers) if hyperloop_unet_skips else 0
+        else:
+            self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        if self.num_skip_weights > 0:
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        else:
+            self.register_buffer(
+                "skip_weights",
+                torch.empty(0, model_dim, dtype=torch.float32),
+                persistent=False,
+            )
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -856,10 +870,15 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
+        skips: list[Tensor] = []
 
         # Begin block.
         for i in range(self.hyperloop_start):
             x = self.blocks[i](x, x0)
+            if self.num_skip_weights > 0:
+                skips.append(x)
+                if len(skips) > self.num_skip_weights:
+                    skips.pop(0)
 
         # Middle block. The residual stream is expanded to n parallel streams;
         # every loop pass reads one C-dimensional mixture, runs the shared middle
@@ -877,8 +896,10 @@ class GPT(nn.Module):
         x = y.mean(dim=2)
 
         # End block.
-        for i in range(self.hyperloop_end + 1, len(self.blocks)):
-            x = self.blocks[i](x, x0)
+        for i, block_idx in enumerate(range(self.hyperloop_end + 1, len(self.blocks))):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[block_idx](x, x0)
         return x
 
     def _project_logits(self, x: Tensor) -> Tensor:
@@ -1036,6 +1057,7 @@ def main() -> None:
         hyperloop_start=args.hyperloop_start,
         hyperloop_end=args.hyperloop_end,
         hyperloop_pos_emb=args.hyperloop_pos_emb,
+        hyperloop_unet_skips=args.hyperloop_unet_skips,
         hyperloop_init_res_bias=args.hyperloop_init_res_bias,
         hyperloop_init_alpha=args.hyperloop_init_alpha,
     ).to(device).bfloat16()
@@ -1113,7 +1135,8 @@ def main() -> None:
         log0(
             f"hyperloop:enabled streams:{args.hyperloop_streams} loops:{args.hyperloop_num_loops} "
             f"middle:{args.hyperloop_start}-{args.hyperloop_end} unrolled_depth:{unrolled_depth} "
-            f"pos_emb:{args.hyperloop_pos_emb} init_res_bias:{args.hyperloop_init_res_bias} "
+            f"pos_emb:{args.hyperloop_pos_emb} unet_skips:{args.hyperloop_unet_skips} "
+            f"skip_weights:{base_model.num_skip_weights} init_res_bias:{args.hyperloop_init_res_bias} "
             f"init_alpha:{args.hyperloop_init_alpha}"
         )
         log0(base_model.hyperloop_stats())
