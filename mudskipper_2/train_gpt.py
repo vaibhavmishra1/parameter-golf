@@ -93,10 +93,16 @@ class Hyperparameters:
     mudskipper_scout_fraction = float(os.environ.get("MUDSKIPPER_SCOUT_FRACTION", 0.125))
     mudskipper_candidate_mult = float(os.environ.get("MUDSKIPPER_CANDIDATE_MULT", 1.25))
     mudskipper_vocab_size = int(os.environ.get("MUDSKIPPER_VOCAB_SIZE", vocab_size))
-    mudskipper_bucket_count = int(os.environ.get("MUDSKIPPER_BUCKET_COUNT", 16))
+    mudskipper_bucket_count = int(os.environ.get("MUDSKIPPER_BUCKET_COUNT", 64))
     mudskipper_recent_hashes = int(os.environ.get("MUDSKIPPER_RECENT_HASHES", 8192))
     mudskipper_log_every = int(os.environ.get("MUDSKIPPER_LOG_EVERY", train_log_every))
     mudskipper_nvidia_smi = bool(int(os.environ.get("MUDSKIPPER_NVIDIA_SMI", "0")))
+    mudskipper_feedback = bool(int(os.environ.get("MUDSKIPPER_FEEDBACK", "1")))
+    mudskipper_feedback_every = int(os.environ.get("MUDSKIPPER_FEEDBACK_EVERY", 1))
+    mudskipper_feedback_weight = float(os.environ.get("MUDSKIPPER_FEEDBACK_WEIGHT", 0.45))
+    mudskipper_reward_ema = float(os.environ.get("MUDSKIPPER_REWARD_EMA", 0.04))
+    mudskipper_reward_clip = float(os.environ.get("MUDSKIPPER_REWARD_CLIP", 0.35))
+    mudskipper_reward_warmup = int(os.environ.get("MUDSKIPPER_REWARD_WARMUP", 32))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -499,10 +505,19 @@ class MudskipperScout:
         self.vocab_size = max(int(args.mudskipper_vocab_size), 2)
         self.bucket_count = max(int(args.mudskipper_bucket_count), 1)
         self.recent_hash_limit = max(int(args.mudskipper_recent_hashes), 0)
+        self.feedback_weight = float(args.mudskipper_feedback_weight)
+        self.reward_alpha = min(max(float(args.mudskipper_reward_ema), 0.0), 1.0)
+        self.reward_clip = max(float(args.mudskipper_reward_clip), 1e-6)
+        self.reward_warmup = max(int(args.mudskipper_reward_warmup), 1)
         self.counts = np.ones(self.vocab_size, dtype=np.float64)
         self.total = float(self.vocab_size)
         self.bucket_seen = np.ones(self.bucket_count, dtype=np.float64)
+        self.bucket_reward = np.zeros(self.bucket_count, dtype=np.float64)
+        self.bucket_feedback = np.zeros(self.bucket_count, dtype=np.int64)
+        self.global_loss_ema = 0.0
+        self.feedback_updates = 0
         self.recent_hashes: dict[int, None] = {}
+        self.unique_thresholds = np.array([0.08, 0.16, 0.32])
 
     def _token_array(self, window: Tensor) -> np.ndarray:
         arr = window[:-1].numpy().astype(np.int64, copy=False)
@@ -524,8 +539,10 @@ class MudskipperScout:
         if arr.size == 0:
             return 0
         token_level = float(arr.mean()) / max(self.vocab_size - 1, 1)
-        raw = 0.50 * token_level + 0.30 * rare_frac + 0.20 * unique_ratio
-        return int(min(self.bucket_count - 1, max(0, math.floor(raw * self.bucket_count))))
+        rare_bin = min(3, max(0, int(rare_frac * 4.0)))
+        unique_bin = int(np.searchsorted(self.unique_thresholds, unique_ratio, side="right"))
+        token_bin = min(3, max(0, int(token_level * 4.0)))
+        return int((rare_bin * 16 + unique_bin * 4 + token_bin) % self.bucket_count)
 
     def score_windows(self, windows: list[Tensor]) -> list[tuple[float, int, bool, int]]:
         rows: list[dict[str, float | int | bool]] = []
@@ -579,10 +596,13 @@ class MudskipperScout:
             surprise = max(0.0, 1.0 - abs(float(ranks[idx]) - 0.70) / 0.70)
             bucket = int(row["bucket"])
             coverage = 1.0 / math.sqrt(float(self.bucket_seen[bucket]))
+            feedback_conf = min(1.0, float(self.bucket_feedback[bucket]) / float(self.reward_warmup))
+            feedback_bonus = self.feedback_weight * feedback_conf * float(self.bucket_reward[bucket])
             score = (
                 0.65 * surprise
                 + 0.20 * float(row["rare_frac"])
                 + 0.15 * coverage
+                + feedback_bonus
                 - 0.35 * float(row["max_frac"])
                 - 0.25 * float(row["repeat_frac"])
             )
@@ -605,6 +625,42 @@ class MudskipperScout:
                 while len(self.recent_hashes) > self.recent_hash_limit:
                     self.recent_hashes.pop(next(iter(self.recent_hashes)))
 
+    def update_feedback(self, scored: list[tuple[float, int, bool, int]], losses: np.ndarray) -> None:
+        if losses.size == 0 or not scored:
+            return
+        losses = losses.astype(np.float64, copy=False)
+        batch_loss = float(np.mean(losses))
+        if self.global_loss_ema <= 0.0:
+            self.global_loss_ema = batch_loss
+        else:
+            self.global_loss_ema = (1.0 - self.reward_alpha) * self.global_loss_ema + self.reward_alpha * batch_loss
+        denom = max(self.global_loss_ema, 1e-6)
+        rel = np.clip(losses / denom - 1.0, -self.reward_clip, self.reward_clip)
+        bucket_sum = np.zeros(self.bucket_count, dtype=np.float64)
+        bucket_count = np.zeros(self.bucket_count, dtype=np.int64)
+        for (_, bucket, junk, _), value in zip(scored, rel, strict=False):
+            if junk:
+                continue
+            bucket_sum[bucket] += float(value)
+            bucket_count[bucket] += 1
+        for bucket in np.nonzero(bucket_count)[0].tolist():
+            bucket_mean = bucket_sum[bucket] / float(bucket_count[bucket])
+            self.bucket_reward[bucket] = (1.0 - self.reward_alpha) * self.bucket_reward[bucket] + self.reward_alpha * bucket_mean
+            self.bucket_feedback[bucket] += int(bucket_count[bucket])
+        self.feedback_updates += 1
+
+    def reward_line(self) -> str:
+        if self.bucket_count <= 0:
+            return "reward:na"
+        best = np.argsort(self.bucket_reward)[-3:][::-1]
+        worst = np.argsort(self.bucket_reward)[:3]
+        best_s = ",".join(f"{int(i)}:{self.bucket_reward[i]:+.3f}/{int(self.bucket_feedback[i])}" for i in best)
+        worst_s = ",".join(f"{int(i)}:{self.bucket_reward[i]:+.3f}/{int(self.bucket_feedback[i])}" for i in worst)
+        return (
+            f"reward_updates:{self.feedback_updates} global_loss_ema:{self.global_loss_ema:.4f} "
+            f"reward_best:{best_s} reward_worst:{worst_s}"
+        )
+
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
@@ -619,6 +675,7 @@ class DistributedTokenLoader:
         self.scout_fraction = 0.0 if args is None else min(max(float(args.mudskipper_scout_fraction), 0.0), 0.95)
         self.candidate_mult = 1.0 if args is None else max(float(args.mudskipper_candidate_mult), 1.0)
         self.scout = MudskipperScout(args) if self.scout_enabled else None
+        self.pending_feedback: list[tuple[float, int, bool, int]] = []
         self.stats = {
             "batches": 0,
             "candidates": 0,
@@ -626,9 +683,11 @@ class DistributedTokenLoader:
             "accepted_scout": 0,
             "skipped": 0,
             "junk_candidates": 0,
+            "feedback": 0,
             "stream_ms": 0.0,
             "score_ms": 0.0,
             "update_ms": 0.0,
+            "feedback_ms": 0.0,
             "h2d_ms": 0.0,
         }
 
@@ -640,6 +699,7 @@ class DistributedTokenLoader:
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
+        self.pending_feedback = []
         t_h2d = time.perf_counter()
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
@@ -689,6 +749,7 @@ class DistributedTokenLoader:
         self.stats["update_ms"] += 1000.0 * (time.perf_counter() - t_update)
 
         local_windows = accepted_windows[self.rank::self.world_size]
+        self.pending_feedback = accepted_scores[self.rank::self.world_size]
         x_cpu = torch.stack([w[:-1].to(dtype=torch.int64) for w in local_windows])
         y_cpu = torch.stack([w[1:].to(dtype=torch.int64) for w in local_windows])
         t_h2d = time.perf_counter()
@@ -708,16 +769,29 @@ class DistributedTokenLoader:
             return self._next_scout_batch(global_tokens, seq_len, grad_accum_steps)
         return self._next_baseline_batch(global_tokens, seq_len, grad_accum_steps)
 
+    def observe_losses(self, per_sequence_loss: Tensor) -> None:
+        if self.scout is None or not self.pending_feedback:
+            return
+        t_feedback = time.perf_counter()
+        losses = per_sequence_loss.detach().float().cpu().numpy()
+        n = min(len(self.pending_feedback), int(losses.shape[0]))
+        self.scout.update_feedback(self.pending_feedback[:n], losses[:n])
+        self.stats["feedback"] += n
+        self.stats["feedback_ms"] += 1000.0 * (time.perf_counter() - t_feedback)
+        self.pending_feedback = []
+
     def stats_line(self, reset: bool = False) -> str:
         s = self.stats.copy()
         batches = max(int(s["batches"]), 1)
+        reward = "" if self.scout is None else " " + self.scout.reward_line()
         line = (
             f"mudskipper scout:{int(self.scout_enabled)} batches:{int(s['batches'])} "
             f"cand:{int(s['candidates'])} base:{int(s['accepted_base'])} "
             f"scout:{int(s['accepted_scout'])} skipped:{int(s['skipped'])} "
-            f"junk:{int(s['junk_candidates'])} "
+            f"junk:{int(s['junk_candidates'])} feedback:{int(s['feedback'])} "
             f"stream_ms/b:{s['stream_ms'] / batches:.2f} score_ms/b:{s['score_ms'] / batches:.2f} "
-            f"update_ms/b:{s['update_ms'] / batches:.2f} h2d_ms/b:{s['h2d_ms'] / batches:.2f}"
+            f"update_ms/b:{s['update_ms'] / batches:.2f} feedback_ms/b:{s['feedback_ms'] / batches:.2f} "
+            f"h2d_ms/b:{s['h2d_ms'] / batches:.2f}{reward}"
         )
         if reset:
             for key in self.stats:
@@ -995,7 +1069,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, return_per_sequence_loss: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1019,6 +1093,11 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        if return_per_sequence_loss:
+            per_token_loss = F.cross_entropy(logits.float(), targets, reduction="none")
+            loss = per_token_loss.mean()
+            per_sequence_loss = per_token_loss.view(input_ids.size(0), input_ids.size(1)).mean(dim=1)
+            return loss, per_sequence_loss.detach()
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1212,6 +1291,11 @@ def main() -> None:
         f"candidate_mult:{args.mudskipper_candidate_mult:.3f} bucket_count:{args.mudskipper_bucket_count} "
         f"recent_hashes:{args.mudskipper_recent_hashes} nvidia_smi:{args.mudskipper_nvidia_smi}"
     )
+    log0(
+        f"mudskipper_feedback:{args.mudskipper_feedback} feedback_every:{args.mudskipper_feedback_every} "
+        f"feedback_weight:{args.mudskipper_feedback_weight:.3f} reward_ema:{args.mudskipper_reward_ema:.3f} "
+        f"reward_clip:{args.mudskipper_reward_clip:.3f} reward_warmup:{args.mudskipper_reward_warmup}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1225,6 +1309,14 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+
+    def wants_feedback(step: int) -> bool:
+        return (
+            args.mudskipper_scout
+            and args.mudskipper_feedback
+            and args.mudskipper_feedback_every > 0
+            and step % args.mudskipper_feedback_every == 0
+        )
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1250,7 +1342,10 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    if wants_feedback(warmup_step):
+                        warmup_loss, _ = model(x, y, True)
+                    else:
+                        warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1318,10 +1413,16 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            collect_feedback = wants_feedback(step)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                if collect_feedback:
+                    loss, per_sequence_loss = model(x, y, True)
+                else:
+                    loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            if collect_feedback:
+                train_loader.observe_losses(per_sequence_loss)
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0

@@ -27,9 +27,9 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# Mudskipper v1: training-time soft per-token reweighting. See mudskipper_1/DESIGN.md.
+# Mudskipper: training-time soft per-token reweighting. See mudskipper_1/DESIGN.md.
 # Import is local to this folder; for a record-track submission this would be inlined.
-from mudskipper import BigramScorer, MudskipperConfig
+from mudskipper import MudskipperConfig, make_scorer
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -932,13 +932,20 @@ def main() -> None:
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     mudskipper_cfg = MudskipperConfig.from_env()
-    scorer: BigramScorer | None = None
+    scorer = None
     if mudskipper_cfg.enabled:
-        scorer = BigramScorer(args.vocab_size, device, mudskipper_cfg)
+        scorer = make_scorer(
+            mudskipper_cfg,
+            args.vocab_size,
+            device,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+        )
         log0(
-            f"mudskipper:enabled alpha:{mudskipper_cfg.alpha} "
-            f"smoothing:{mudskipper_cfg.smoothing} "
-            f"clamp_max:{mudskipper_cfg.weight_clamp_max}"
+            f"mudskipper:enabled mode:{mudskipper_cfg.mode} alpha:{mudskipper_cfg.alpha} "
+            f"clamp_max:{mudskipper_cfg.weight_clamp_max} "
+            f"byte_min:{mudskipper_cfg.byte_min}"
         )
     else:
         log0("mudskipper:disabled")
@@ -990,10 +997,19 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        # Reset the bigram scorer so real training starts from a clean slate
-        # rather than carrying state from warmup batches we just discarded.
+        # Reset the scorer so real training starts from a clean slate. ByteScorer
+        # is stateless apart from its tokens-observed counter, but rebuilding
+        # the scorer is cheap and keeps the post-warmup state symmetric across
+        # modes.
         if scorer is not None:
-            scorer = BigramScorer(args.vocab_size, device, mudskipper_cfg)
+            scorer = make_scorer(
+                mudskipper_cfg,
+                args.vocab_size,
+                device,
+                base_bytes_lut=base_bytes_lut,
+                has_leading_space_lut=has_leading_space_lut,
+                is_boundary_token_lut=is_boundary_token_lut,
+            )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1057,8 +1073,10 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
             if scorer is not None:
-                # Update bigram counts AFTER weight computation to avoid
-                # leaking the current target into its own weight.
+                # Update scorer state AFTER weight computation. For ByteScorer
+                # this is just bumping the tokens_observed counter; for
+                # BigramScorer it also updates counts so the next batch uses
+                # transitions we've already trained on.
                 scorer.update(x, y)
                 # Cache diagnostics from the last microbatch only — cheap and
                 # representative since microbatches are i.i.d. windows.
@@ -1067,9 +1085,7 @@ def main() -> None:
                     and (step + 1) % mudskipper_cfg.log_every == 0
                     and micro_step == grad_accum_steps - 1
                 ):
-                    last_weight_diag = scorer.diagnostics(
-                        weights, scorer.surprise(x, y)
-                    )
+                    last_weight_diag = scorer.diagnostics(weights, x, y)
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1099,16 +1115,9 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
         if last_weight_diag is not None:
-            log0(
-                f"mudskipper_step:{step} "
-                f"w_min:{last_weight_diag['weight_min']:.3f} "
-                f"w_max:{last_weight_diag['weight_max']:.3f} "
-                f"w_mean:{last_weight_diag['weight_mean']:.3f} "
-                f"w_std:{last_weight_diag['weight_std']:.3f} "
-                f"surp_p50:{last_weight_diag['surprise_p50']:.3f} "
-                f"surp_p95:{last_weight_diag['surprise_p95']:.3f} "
-                f"toks_obs:{last_weight_diag['tokens_observed']:.0f}"
-            )
+            # Format depends on the active scorer; we just dump every key.
+            diag_str = " ".join(f"{k}:{v:.3f}" for k, v in last_weight_diag.items())
+            log0(f"mudskipper_step:{step} {diag_str}")
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
