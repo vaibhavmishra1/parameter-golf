@@ -81,6 +81,20 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    ms_muon_enabled = bool(int(os.environ.get("MS_MUON_ENABLED", "1")))
+    ms_muon_betas = tuple(
+        float(part.strip())
+        for part in os.environ.get("MS_MUON_BETAS", "0.96875,0.9921875,0.998046875").split(",")
+        if part.strip()
+    )
+    ms_muon_lr_mult = float(os.environ.get("MS_MUON_LR_MULT", 0.8333333333333334))
+    ms_muon_warmup_tokens = int(os.environ.get("MS_MUON_WARMUP_TOKENS", 10_000_000))
+    ms_muon_warmup_steps = int(
+        os.environ.get("MS_MUON_WARMUP_STEPS", max(1, math.ceil(ms_muon_warmup_tokens / train_batch_tokens)))
+    )
+    ms_muon_clip_z = float(os.environ.get("MS_MUON_CLIP_Z", 2.0))
+    ms_muon_cooldown_frac = float(os.environ.get("MS_MUON_COOLDOWN_FRAC", 0.0))
+    ms_muon_shape_scale = os.environ.get("MS_MUON_SHAPE_SCALE", "mup")
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -94,19 +108,19 @@ class Hyperparameters:
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
+    # Orthogonalize update matrices with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
-    X /= X.norm() + eps
-    transposed = G.size(0) > G.size(1)
+    X /= X.norm(dim=(-2, -1), keepdim=True) + eps
+    transposed = G.size(-2) > G.size(-1)
     if transposed:
-        X = X.T
+        X = X.transpose(-2, -1)
     for _ in range(steps):
-        A = X @ X.T
+        A = X @ X.transpose(-2, -1)
         B = b * A + c * A @ A
         X = a * X + B @ X
-    return X.T if transposed else X
+    return X.transpose(-2, -1) if transposed else X
 
 
 class Muon(torch.optim.Optimizer):
@@ -154,6 +168,136 @@ class Muon(torch.optim.Optimizer):
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
+
+            if distributed:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            curr = 0
+            for p in params:
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                p.add_(g, alpha=-lr)
+                curr += p.numel()
+
+        return loss
+
+
+def multiscale_base_scales(betas: tuple[float, ...], cooldown_frac: float = 0.0) -> tuple[float, ...]:
+    min_beta = min(betas)
+    max_beta = max(betas)
+    raw = tuple((1.0 - beta) / max(1.0 - min_beta, 1e-12) for beta in betas)
+    denom = math.sqrt(sum(raw) + 1e-6)
+    scales: list[float] = []
+    for beta, scale in zip(betas, raw, strict=True):
+        cooldown = (1.0 - max_beta) / max(1.0 - beta, 1e-12)
+        scales.append(0.0 if cooldown_frac > cooldown else scale / denom)
+    return tuple(scales)
+
+
+class MultiscaleMuon(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        betas: tuple[float, ...],
+        backend_steps: int,
+        lr_mult: float,
+        clip_z: float,
+        cooldown_frac: float,
+        shape_scale: str,
+    ):
+        if not betas:
+            raise ValueError("MS_MUON_BETAS must contain at least one beta")
+        for beta in betas:
+            if not (0.0 <= beta < 1.0):
+                raise ValueError(f"MS_MUON_BETAS must be in [0, 1), got {beta}")
+        shape_scale = shape_scale.lower()
+        if shape_scale not in {"mup", "baseline", "none"}:
+            raise ValueError(f"MS_MUON_SHAPE_SCALE must be mup, baseline, or none; got {shape_scale}")
+        scales = multiscale_base_scales(betas, cooldown_frac)
+        super().__init__(
+            params,
+            dict(
+                lr=lr,
+                betas=betas,
+                scales=scales,
+                accumulate=tuple(1.0 if i == 0 else 0.0 for i in range(len(betas))),
+                backend_steps=backend_steps,
+                lr_mult=lr_mult,
+                clip_z=clip_z,
+                shape_scale=shape_scale,
+            ),
+        )
+
+    def set_warmup_frac(self, warmup_frac: float) -> None:
+        warmup_frac = min(max(float(warmup_frac), 0.0), 1.0)
+        for group in self.param_groups:
+            betas = group["betas"]
+            group["accumulate"] = tuple(warmup_frac**i for i in range(len(betas)))
+
+    @staticmethod
+    def _shape_correction(update: Tensor, mode: str) -> float:
+        if mode == "none":
+            return 1.0
+        rows, cols = update.size(-2), update.size(-1)
+        if mode == "mup":
+            return max(cols / rows, 1.0)
+        return max(1.0, rows / cols) ** 0.5
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr = group["lr"] * group["lr_mult"]
+            betas = group["betas"]
+            scales = group["scales"]
+            accumulate = group["accumulate"]
+            backend_steps = group["backend_steps"]
+            clip_z = group["clip_z"]
+            shape_scale = group["shape_scale"]
+
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    if clip_z > 0:
+                        limit = clip_z * g.float().square().mean().sqrt().to(dtype=g.dtype)
+                        g = torch.clamp(g, min=-limit, max=limit)
+
+                    state = self.state[p]
+                    if "momentum_buffers" not in state or len(state["momentum_buffers"]) != len(betas):
+                        state["momentum_buffers"] = [torch.zeros_like(g) for _ in betas]
+                    bufs = state["momentum_buffers"]
+
+                    candidates: list[Tensor] = []
+                    for beta, scale, acc, buf in zip(betas, scales, accumulate, bufs, strict=True):
+                        buf.mul_(beta).add_(g, alpha=acc * (1.0 - beta))
+                        if scale != 0.0:
+                            candidates.append(g.mul(1.0 - beta).add(buf, alpha=beta))
+                    if candidates:
+                        orthogonalized = zeropower_via_newtonschulz5(torch.stack(candidates), steps=backend_steps)
+                        active_scales = [scale for scale in scales if scale != 0.0]
+                        update = orthogonalized[0].mul(active_scales[0])
+                        for tensor, scale in zip(orthogonalized[1:], active_scales[1:], strict=True):
+                            update = update.add(tensor, alpha=scale)
+                    else:
+                        update = torch.zeros_like(g)
+                    update = update.mul(self._shape_correction(update, shape_scale))
+                    updates_flat[curr : curr + p.numel()] = update.reshape(-1)
                 curr += p.numel()
 
             if distributed:
@@ -868,11 +1012,24 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
+    optimizer_muon = (
+        MultiscaleMuon(
+            matrix_params,
+            lr=args.matrix_lr,
+            betas=args.ms_muon_betas,
+            backend_steps=args.muon_backend_steps,
+            lr_mult=args.ms_muon_lr_mult,
+            clip_z=args.ms_muon_clip_z,
+            cooldown_frac=args.ms_muon_cooldown_frac,
+            shape_scale=args.ms_muon_shape_scale,
+        )
+        if args.ms_muon_enabled
+        else Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -897,6 +1054,22 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    if args.ms_muon_enabled:
+        ms_scales = multiscale_base_scales(args.ms_muon_betas, args.ms_muon_cooldown_frac)
+        log0(
+            "optimizer:multiscale_muon "
+            f"betas:{','.join(f'{beta:.8g}' for beta in args.ms_muon_betas)} "
+            f"scales:{','.join(f'{scale:.5f}' for scale in ms_scales)} "
+            f"lr_mult:{args.ms_muon_lr_mult:.6g} effective_matrix_lr:{args.matrix_lr * args.ms_muon_lr_mult:.6g} "
+            f"warmup_steps:{args.ms_muon_warmup_steps} clip_z:{args.ms_muon_clip_z:.3g} "
+            f"shape_scale:{args.ms_muon_shape_scale}"
+        )
+    else:
+        log0(
+            f"optimizer:muon momentum:{args.muon_momentum} "
+            f"momentum_warmup:{args.muon_momentum_warmup_start}->{args.muon_momentum} "
+            f"warmup_steps:{args.muon_momentum_warmup_steps}"
+        )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1018,10 +1191,14 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        if args.ms_muon_enabled:
+            warmup_frac = min(step / args.ms_muon_warmup_steps, 1.0) if args.ms_muon_warmup_steps > 0 else 1.0
+            optimizer_muon.set_warmup_frac(warmup_frac)
+        else:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
