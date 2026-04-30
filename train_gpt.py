@@ -241,7 +241,9 @@ class MultiscaleMuon(torch.optim.Optimizer):
             return 1.0
         rows, cols = update.size(-2), update.size(-1)
         if mode == "mup":
-            return max(cols / rows, 1.0)
+            # The JAX reference stores Dense kernels as (in, out), while
+            # PyTorch Linear weights are (out, in), so transpose the ratio.
+            return max(rows / cols, 1.0)
         return max(1.0, rows / cols) ** 0.5
 
     @torch.no_grad()
