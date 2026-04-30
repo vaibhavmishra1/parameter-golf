@@ -70,6 +70,13 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # Head Frequency Diversification. This is not a named paper method; it is a
+    # RoPE-frequency/head-specialization hypothesis from dump/train_gpt_mlx_hfd.py.
+    hfd_enabled = bool(int(os.environ.get("HFD_ENABLED", "1")))
+    hfd_rope_base_spread = float(os.environ.get("HFD_ROPE_BASE_SPREAD", 10.0))
+    hfd_qk_gain_spread = float(os.environ.get("HFD_QK_GAIN_SPREAD", 2.0))
+    hfd_log_stats = bool(int(os.environ.get("HFD_LOG_STATS", "1")))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -525,6 +532,7 @@ class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
+        self.base = float(base)
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
@@ -552,6 +560,19 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def hfd_group_values(num_groups: int, center: float, spread: float, invert: bool = False) -> list[float]:
+    if num_groups <= 1 or spread <= 1.0:
+        return [float(center)] * max(num_groups, 1)
+    half = (num_groups - 1) / 2.0
+    values: list[float] = []
+    for group_idx in range(num_groups):
+        exponent = (group_idx - half) / half
+        if invert:
+            exponent = -exponent
+        values.append(float(center) * (float(spread) ** exponent))
+    return values
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -560,6 +581,9 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        hfd_enabled: bool,
+        hfd_rope_base_spread: float,
+        hfd_qk_gain_spread: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -568,6 +592,7 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        self.q_heads_per_kv = num_heads // num_kv_heads
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
@@ -577,8 +602,19 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.hfd_enabled = bool(hfd_enabled and num_kv_heads > 1)
+        if self.hfd_enabled and hfd_rope_base_spread > 1.0:
+            self.hfd_rope_bases = hfd_group_values(num_kv_heads, rope_base, hfd_rope_base_spread)
+        else:
+            self.hfd_rope_bases = [float(rope_base)]
+        if self.hfd_enabled and hfd_qk_gain_spread > 1.0:
+            group_gains = hfd_group_values(num_kv_heads, qk_gain_init, hfd_qk_gain_spread, invert=True)
+            head_gains = [gain for gain in group_gains for _ in range(self.q_heads_per_kv)]
+        else:
+            head_gains = [float(qk_gain_init)] * num_heads
+        self.hfd_q_gain_init = [float(v) for v in head_gains]
+        self.q_gain = nn.Parameter(torch.tensor(head_gains, dtype=torch.float32))
+        self.rotaries = nn.ModuleList([Rotary(self.head_dim, base=base) for base in self.hfd_rope_bases])
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -587,9 +623,21 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if len(self.rotaries) == 1:
+            cos, sin = self.rotaries[0](seqlen, x.device, q.dtype)
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
+        else:
+            q_parts: list[Tensor] = []
+            k_parts: list[Tensor] = []
+            for group_idx, rotary in enumerate(self.rotaries):
+                q_start = group_idx * self.q_heads_per_kv
+                q_end = q_start + self.q_heads_per_kv
+                cos, sin = rotary(seqlen, x.device, q.dtype)
+                q_parts.append(apply_rotary_emb(q[:, q_start:q_end], cos, sin))
+                k_parts.append(apply_rotary_emb(k[:, group_idx : group_idx + 1], cos, sin))
+            q = torch.cat(q_parts, dim=1)
+            k = torch.cat(k_parts, dim=1)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -626,11 +674,23 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        hfd_enabled: bool,
+        hfd_rope_base_spread: float,
+        hfd_qk_gain_spread: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            hfd_enabled,
+            hfd_rope_base_spread,
+            hfd_qk_gain_spread,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -659,6 +719,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        hfd_enabled: bool,
+        hfd_rope_base_spread: float,
+        hfd_qk_gain_spread: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +743,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    hfd_enabled,
+                    hfd_rope_base_spread,
+                    hfd_qk_gain_spread,
                 )
                 for i in range(num_layers)
             ]
@@ -722,6 +788,34 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+
+def _fmt_float_list(values: list[float], digits: int = 4) -> str:
+    return "[" + ",".join(f"{v:.{digits}g}" for v in values) + "]"
+
+
+def hfd_config_line(model: GPT) -> str:
+    attn = model.blocks[0].attn
+    return (
+        f"hfd_config enabled:{int(attn.hfd_enabled)} q_heads_per_kv:{attn.q_heads_per_kv} "
+        f"rope_bases:{_fmt_float_list(attn.hfd_rope_bases)} "
+        f"q_gain_init:{_fmt_float_list(attn.hfd_q_gain_init)}"
+    )
+
+
+def hfd_q_gain_stats_line(model: GPT) -> str:
+    with torch.no_grad():
+        gains = torch.stack([block.attn.q_gain.detach().float().cpu() for block in model.blocks])
+    attn = model.blocks[0].attn
+    grouped = gains.reshape(gains.size(0), attn.num_kv_heads, attn.q_heads_per_kv).mean(dim=2)
+    first_groups = [float(x) for x in grouped[0].tolist()]
+    last_groups = [float(x) for x in grouped[-1].tolist()]
+    all_vals = gains.flatten()
+    return (
+        f"hfd_q_gain mean:{float(all_vals.mean()):.4f} std:{float(all_vals.std(unbiased=False)):.4f} "
+        f"min:{float(all_vals.min()):.4f} max:{float(all_vals.max()):.4f} "
+        f"layer0_groups:{_fmt_float_list(first_groups)} layer_last_groups:{_fmt_float_list(last_groups)}"
+    )
 
 
 # -----------------------------
@@ -835,6 +929,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        hfd_enabled=args.hfd_enabled,
+        hfd_rope_base_spread=args.hfd_rope_base_spread,
+        hfd_qk_gain_spread=args.hfd_qk_gain_spread,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -897,6 +994,13 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"hfd_enabled:{args.hfd_enabled} hfd_rope_base_spread:{args.hfd_rope_base_spread:.4g} "
+        f"hfd_qk_gain_spread:{args.hfd_qk_gain_spread:.4g} qk_gain_init:{args.qk_gain_init:.4g}"
+    )
+    log0(hfd_config_line(base_model))
+    if args.hfd_log_stats and master_process:
+        log0(hfd_q_gain_stats_line(base_model))
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1044,6 +1148,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if args.hfd_log_stats and master_process:
+                log0(hfd_q_gain_stats_line(base_model))
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1058,6 +1164,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if args.hfd_log_stats and master_process:
+        log0(hfd_q_gain_stats_line(base_model))
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
