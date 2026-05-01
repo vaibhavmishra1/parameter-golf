@@ -1,5 +1,7 @@
 # Gated XSA + CaseOps + LQER g32/top4 + In-Timer N-gram Tilt
 
+
+My submission PR : https://github.com/openai/parameter-golf/pull/2124
 The default run is:
 
 - V21/Gated-XSA transformer with in-timer token-only n-gram tilt.
