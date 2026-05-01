@@ -4615,17 +4615,13 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
             short_schedule
             and not short_budget_disabled
             and h.ttt_short_eval_budget_seconds > 0
-            and queue_idx > 0
         ):
             elapsed = time.perf_counter() - t_start
-            progress = queue_idx / max(queue_len, 1)
-            projected = elapsed / max(progress, 1e-6)
-            if projected > h.ttt_short_eval_budget_seconds:
+            if elapsed > h.ttt_short_eval_budget_seconds:
                 short_budget_disabled = True
                 log(
                     "ttt_short:budget_disable "
-                    f"elapsed:{elapsed:.1f}s progress:{progress:.3f} "
-                    f"projected:{projected:.1f}s "
+                    f"elapsed:{elapsed:.1f}s "
                     f"budget:{h.ttt_short_eval_budget_seconds:.1f}s"
                 )
         if bsz == reusable_lora.bsz:
