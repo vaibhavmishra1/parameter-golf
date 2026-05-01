@@ -109,4 +109,11 @@ export SEED RUN_ID DATA_PATH TOKENIZER_PATH \
        GPTQ_RESERVE_SECONDS GPTQ_CALIBRATION_BATCHES \
        COMPRESSOR CASEOPS_ENABLED VOCAB_SIZE
 
+if ! grep -q "SHORT_TTT_PATCH_ID" "${SCRIPT_DIR}/train_gpt.py"; then
+  echo "ERROR: ${SCRIPT_DIR}/train_gpt.py does not contain the short-TTT patch" >&2
+  exit 1
+fi
+echo "run.sh: train_gpt=${SCRIPT_DIR}/train_gpt.py"
+echo "run.sh: TTT_SHORT_SCORE_FIRST_ENABLED=${TTT_SHORT_SCORE_FIRST_ENABLED} steps=${TTT_SHORT_SCORE_FIRST_STEPS}"
+
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" "${SCRIPT_DIR}/train_gpt.py"

@@ -11,6 +11,8 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+SHORT_TTT_PATCH_ID = "short_score_first_ttt_v2"
+
 
 
 
@@ -1194,12 +1196,16 @@ class Hyperparameters:
     embed_wd = float(os.environ.get("EMBED_WD", 0.085))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_eval_only = bool(int(os.environ.get("TTT_EVAL_ONLY", os.environ.get("EVAL_ONLY", "0"))))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 48))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
     ttt_grad_steps = int(os.environ.get("TTT_GRAD_STEPS", 1))
+    ttt_short_score_first_enabled = bool(int(os.environ.get("TTT_SHORT_SCORE_FIRST_ENABLED", "1")))
+    ttt_short_score_first_steps = os.environ.get("TTT_SHORT_SCORE_FIRST_STEPS", "256:8,2000:24")
+    ttt_short_eval_budget_seconds = float(os.environ.get("TTT_SHORT_EVAL_BUDGET_SECONDS", "565"))
     # V19: PR #1886 (renqianluo) + sunnypatneedi research log 2026-04-28 found that
     # the Triton fused-CE kernel's fp32-accumulation interacts with warm-start LoRA-A
     # to destabilize seeds 314/1337 at TTT_WEIGHT_DECAY=1.0. Raising the default to
@@ -1374,15 +1380,20 @@ class Hyperparameters:
         if artifact_dir
         else f"logs/{run_id}.txt"
     )
-    model_path = (
+    _default_model_path = (
         os.path.join(artifact_dir, "final_model.pt")
         if artifact_dir
         else "final_model.pt"
     )
-    quantized_model_path = (
+    model_path = os.environ.get("MODEL_PATH", _default_model_path)
+    _default_quantized_model_path = (
         os.path.join(artifact_dir, "final_model.int6.ptz")
         if artifact_dir
         else "final_model.int6.ptz"
+    )
+    quantized_model_path = os.environ.get(
+        "QUANTIZED_MODEL_PATH",
+        os.environ.get("EVAL_MODEL_PATH", _default_quantized_model_path),
     )
 
 
@@ -4234,6 +4245,30 @@ def _compute_chunk_window(ci, pred_len, num_chunks, chunk_size, eval_seq_len):
     return win_start, win_len, chunk_offset, chunk_len
 
 
+def _ttt_short_schedule(h):
+    if not getattr(h, "ttt_short_score_first_enabled", False):
+        return []
+    schedule = []
+    for item in str(getattr(h, "ttt_short_score_first_steps", "")).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        max_len_s, chunk_s = item.split(":", 1)
+        max_len, chunk = int(max_len_s), int(chunk_s)
+        if max_len <= 0 or chunk <= 0:
+            raise ValueError(f"Bad TTT_SHORT_SCORE_FIRST_STEPS entry: {item!r}")
+        schedule.append((max_len, chunk))
+    schedule.sort()
+    return schedule
+
+
+def _ttt_chunk_for_pred_len(pred_len, base_chunk_size, short_schedule):
+    for max_len, chunk_size in short_schedule:
+        if pred_len <= max_len:
+            return min(chunk_size, base_chunk_size)
+    return base_chunk_size
+
+
 def _accumulate_bpb(
     ptl,
     x,
@@ -4506,7 +4541,17 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
         f"suffix_docs:{len(doc_entries) - prefix_doc_limit}"
         f" num_phases:{num_phases} boundaries:{phase_boundaries}"
     )
-    chunk_size, eval_seq_len = h.ttt_chunk_size, h.ttt_eval_seq_len
+    base_chunk_size, eval_seq_len = h.ttt_chunk_size, h.ttt_eval_seq_len
+    short_schedule = _ttt_short_schedule(h)
+    if getattr(h, "ttt_short_score_first_enabled", False) and not short_schedule:
+        raise RuntimeError("TTT_SHORT_SCORE_FIRST_ENABLED=1 but no short-TTT schedule parsed")
+    if short_schedule:
+        log(
+            "ttt_short:enabled "
+            f"base_chunk:{base_chunk_size} schedule:"
+            f"{','.join(f'{m}:{c}' for m, c in short_schedule)} "
+            f"budget:{h.ttt_short_eval_budget_seconds:.1f}s"
+        )
     eval_batch_set = None
     if h.ttt_eval_batches:
         eval_batch_set = set(int(x) for x in h.ttt_eval_batches.split(",") if x.strip())
@@ -4554,6 +4599,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
     reusable_opt = _build_opt(reusable_lora)
     local_scored_docs = []
     global_ttt_done = prefix_doc_limit == 0
+    short_budget_disabled = False
     try:
       while True:
         queue_idx = _claim_next_batch(counter_path, queue_len)
@@ -4565,6 +4611,23 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
         prev_loss = loss_sum.item()
         prev_bytes = byte_sum.item()
         prev_tokens = token_count.item()
+        if (
+            short_schedule
+            and not short_budget_disabled
+            and h.ttt_short_eval_budget_seconds > 0
+            and queue_idx > 0
+        ):
+            elapsed = time.perf_counter() - t_start
+            progress = queue_idx / max(queue_len, 1)
+            projected = elapsed / max(progress, 1e-6)
+            if projected > h.ttt_short_eval_budget_seconds:
+                short_budget_disabled = True
+                log(
+                    "ttt_short:budget_disable "
+                    f"elapsed:{elapsed:.1f}s progress:{progress:.3f} "
+                    f"projected:{projected:.1f}s "
+                    f"budget:{h.ttt_short_eval_budget_seconds:.1f}s"
+                )
         if bsz == reusable_lora.bsz:
             reusable_lora.reset()
             for s in reusable_opt.state.values():
@@ -4582,7 +4645,16 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
             ).to(device)
             cur_opt = _build_opt(cur_lora)
         pred_lens = [doc_len - 1 for _, doc_len in batch]
-        num_chunks = [(pl + chunk_size - 1) // chunk_size for pl in pred_lens]
+        if short_schedule and not short_budget_disabled:
+            chunk_sizes = [
+                _ttt_chunk_for_pred_len(pl, base_chunk_size, short_schedule)
+                for pl in pred_lens
+            ]
+        else:
+            chunk_sizes = [base_chunk_size] * bsz
+        num_chunks = [
+            (pl + cs - 1) // cs for pl, cs in zip(pred_lens, chunk_sizes)
+        ]
         max_nc = max(num_chunks)
         num_chunks_t = torch.tensor(num_chunks, dtype=torch.int64, device=device)
         for ci in range(max_nc):
@@ -4597,15 +4669,13 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
                     continue
                 doc_start, doc_len = batch[b]
                 win_start, win_len, chunk_offset, chunk_len = _compute_chunk_window(
-                    ci, pred_lens[b], num_chunks[b], chunk_size, eval_seq_len
+                    ci, pred_lens[b], num_chunks[b], chunk_sizes[b], eval_seq_len
                 )
                 tok_starts[b] = doc_start + win_start
                 tok_wls[b] = win_len
                 chunk_offsets_cpu[b] = chunk_offset
                 chunk_lens_cpu[b] = chunk_len
-            _, context_size, chunk_offset, _ = _compute_chunk_window(
-                ci, (ci + 1) * chunk_size, ci + 1, chunk_size, eval_seq_len
-            )
+            context_size = int(tok_wls.max().item())
             col_idx = torch.arange(context_size + 1)
             idx = tok_starts.unsqueeze(1) + col_idx.unsqueeze(0)
             idx.clamp_(max=all_tokens.numel() - 1)
@@ -4702,9 +4772,17 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                             per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
-                    per_doc = per_tok_loss[
-                        :, chunk_offset : chunk_offset + chunk_size
-                    ].mean(dim=-1)
+                    train_pos = torch.arange(
+                        per_tok_loss.size(1), device=device, dtype=torch.int64
+                    ).unsqueeze(0)
+                    train_mask = (
+                        (train_pos >= chunk_offsets.unsqueeze(1))
+                        & (train_pos < (chunk_offsets + chunk_lens).unsqueeze(1))
+                    )
+                    train_mask_f = train_mask.to(per_tok_loss.dtype)
+                    per_doc = (per_tok_loss * train_mask_f).sum(dim=-1) / (
+                        train_mask_f.sum(dim=-1).clamp_min(1.0)
+                    )
                     cur_opt.zero_grad(set_to_none=True)
                     (per_doc * activate_chunk_mask).sum().backward()
                     cur_opt.step()
@@ -4730,7 +4808,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
             log(
                 f"ttp: b{batch_num}/{queue_len} bl:{b_loss:.4f} bb:{b_bpb:.4f} "
                 f"rl:{r_loss:.4f} rb:{r_bpb:.4f} dl:{min(doc_lens)}-{max(doc_lens)} "
-                f"gd:{int(global_ttt_done)}"
+                f"cs:{min(chunk_sizes)}-{max(chunk_sizes)} gd:{int(global_ttt_done)}"
             )
         if not global_ttt_done:
             local_scored_docs.extend(
@@ -5068,13 +5146,15 @@ def train_and_eval(h, device):
         f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}"
     )
     log(f"val_tokens: {val_data.val_tokens.numel()-1}")
+    log(f"patch_id:{SHORT_TTT_PATCH_ID} train_gpt:{Path(__file__).resolve()}")
     # TTT_EVAL_ONLY: skip training + GPTQ, jump straight to TTT eval on a
     # pre-existing quantized artifact. Used to test TTT-only improvements
     # (e.g., PR-1767's alpha/warm-start/WD) without retraining.
-    ttt_eval_only = os.environ.get("TTT_EVAL_ONLY", "0") == "1"
+    ttt_eval_only = h.ttt_eval_only
     quantize_only = os.environ.get("QUANTIZE_ONLY", "0") == "1"
     if ttt_eval_only:
         log("TTT_EVAL_ONLY=1 — skipping training + GPTQ, loading saved artifact for TTT eval")
+        log(f"ttt_eval_only artifact: {h.quantized_model_path}")
         log(f"ttt_lora_alpha: {BatchedLinearLoRA._ALPHA}")
         log(f"ttt_warm_start_a: {BatchedLinearLoRA._WARM_START_A}")
         log(f"ttt_weight_decay: {h.ttt_weight_decay}")
@@ -5110,10 +5190,11 @@ def train_and_eval(h, device):
         serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
         if h.distributed:
             dist.barrier()
-    eval_model = deserialize(h, device)
-    if h.num_loops > 0:
-        eval_model.looping_active = True
+    eval_model = None
     if not ttt_eval_only:
+        eval_model = deserialize(h, device)
+        if h.num_loops > 0:
+            eval_model.looping_active = True
         compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
         compiled_forward_logits = torch.compile(
             eval_model.forward_logits, dynamic=False, fullgraph=True
@@ -5131,8 +5212,6 @@ def train_and_eval(h, device):
     if h.ttt_enabled:
         if not ttt_eval_only:
             del compiled_model
-        if ttt_eval_only:
-            del eval_model
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         ttt_model = deserialize(h, device)
@@ -5181,6 +5260,12 @@ def train_and_eval(h, device):
             BOS_ID = 1
         t_warmup = time.perf_counter()
         warmup_bszes = [h.ttt_batch_size]
+        warmup_ctx_lens = sorted(
+            set(
+                [h.ttt_chunk_size, h.ttt_eval_seq_len]
+                + [c for _, c in _ttt_short_schedule(h)]
+            )
+        )
         for bsz in warmup_bszes:
             wl = BatchedTTTLoRA(
                 bsz, ttt_model, h.ttt_lora_rank,
@@ -5194,7 +5279,7 @@ def train_and_eval(h, device):
                 weight_decay=h.ttt_weight_decay,
                 fused=True,
             )
-            for ctx_len in (h.ttt_chunk_size, h.ttt_eval_seq_len):
+            for ctx_len in warmup_ctx_lens:
                 xw = torch.randint(0, h.vocab_size, (bsz, ctx_len), device=device, dtype=torch.int64)
                 yw = torch.randint(0, h.vocab_size, (bsz, ctx_len), device=device, dtype=torch.int64)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
