@@ -2,8 +2,8 @@
 
 The default run is:
 
-- PR #2018-style V21/Gated-XSA architecture and in-timer token-only n-gram tilt.
-- PR #2060 LQER/GPTQ retune: `MATRIX_LR=0.028`, `LQER_RANK=2`, `LQER_ASYM_GROUP=32`, `LQER_TOP_K=4`.
+- V21/Gated-XSA transformer with in-timer token-only n-gram tilt.
+- LQER/GPTQ retune: `MATRIX_LR=0.028`, `LQER_RANK=2`, `LQER_ASYM_GROUP=32`, `LQER_TOP_K=4`.
 - CaseOps SP8192 tokenizer and byte sidecar scoring.
 - One-phase score-first TTT with 1000 prefix docs, keeping eval under the 600s cap.
 
@@ -26,7 +26,7 @@ The folder includes three successful 8xH100 logs.
 
 ### Architecture and training
 
-The architecture follows the PR #2018 lineage:
+The architecture is an integrated CaseOps/Gated-XSA stack:
 
 - 11-layer, 512-dim, 8-head GQA transformer with 4 KV heads.
 - CaseOps SP8192 lossless-caps tokenizer and byte sidecar validation scoring.
@@ -37,11 +37,11 @@ The architecture follows the PR #2018 lineage:
 - Fused CE training path, FA3 attention, partial RoPE, logit softcap.
 - EMA applied before quantization.
 
-The training loop and optimizer routing are otherwise kept close to the PR #2018 base. The run stops on the 600s wallclock cap.
+The training loop and optimizer routing are kept conservative. The run stops on the 600s wallclock cap.
 
 ### Quantization
 
-The final quantization path is the PR #2018 GPTQ/LQER/AWQ-lite path with PR #2060's portable LQER retune:
+The final quantization path uses GPTQ/LQER/AWQ-lite with the g32/top4 LQER retune:
 
 | Setting | Value |
 |---|---:|
@@ -58,7 +58,7 @@ The largest included g32/top4 run was 15,987,537 bytes, leaving 12,463 bytes of 
 
 ### Evaluation
 
-Evaluation keeps the conservative PR #2018 timing recipe:
+Evaluation uses the conservative score-first TTT timing recipe:
 
 | Setting | Value |
 |---|---:|
@@ -140,11 +140,11 @@ SEED=42 ./run.sh
 
 ## Lineage and Credits
 
-This submission is a recombination/tuning entry. Key public sources:
+This submission combines public Parameter Golf components into a single final recipe:
 
-- [PR #2018](https://github.com/openai/parameter-golf/pull/2018) by `simon-marcus`: Gated XSA stack, token-only in-timer n-gram tilt, and the main code lineage.
+- Gated XSA stack and in-timer token-only n-gram tilt implementation by `simon-marcus`.
 - [PR #2060](https://github.com/openai/parameter-golf/pull/2060) by `S0urC10ud`: LQER/GPTQ retune ported here where supported.
-- [PR #2007](https://github.com/openai/parameter-golf/pull/2007) by `Elubrazione`: Long-context/QK/AsymLogit lineage used by later stacks.
+- [PR #2007](https://github.com/openai/parameter-golf/pull/2007) by `Elubrazione`: long-context/QK/asymmetric-logit lineage used by later stacks.
 - [PR #1967](https://github.com/openai/parameter-golf/pull/1967) by `ndokutovich`: V21 + n-gram tilt + LeakyReLU base lineage.
 - [PR #1948](https://github.com/openai/parameter-golf/pull/1948) by `TimS-ml`: LeakyReLU squared slope sweep.
 - [PR #1953](https://github.com/openai/parameter-golf/pull/1953) by `andrewbaggio1`: TTT/QK tuning lineage.
