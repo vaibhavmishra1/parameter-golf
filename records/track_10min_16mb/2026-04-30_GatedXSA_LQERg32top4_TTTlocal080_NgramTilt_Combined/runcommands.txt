@@ -1,0 +1,7 @@
+huggingface-cli download romeerp/parameter-golf-caseops-v1 \
+  --repo-type dataset \
+  --local-dir ./data/datasets/fineweb10B_sp8192_caseops/
+
+
+export DATA_PATH=./data/datasets/fineweb10B_sp8192_caseops/datasets/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved
+SEED=42 ./run.sh
