@@ -1,4 +1,4 @@
-import base64, collections, copy, fcntl, glob, io, lzma, math, os
+import base64, collections, copy, ctypes, fcntl, glob, io, lzma, math, os, resource
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import Tensor, nn
@@ -10,6 +10,914 @@ from concurrent.futures import ThreadPoolExecutor
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+
+
+
+# ===== Inlined online n-gram tilt helpers =====
+# Keep the eval-time n-gram scorer and native state machine in this script so
+# the submitted training/eval logic is self-contained and fully counted here.
+_ONLINE_NGRAM_STATE_C = r"""
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define COEFF_COUNT 32
+
+static const uint64_t ROLLING_COEFFS[COEFF_COUNT] = {
+    36313ULL,   27191ULL,   51647ULL,   81929ULL,   131071ULL,  196613ULL,
+    262147ULL,  393241ULL,  524309ULL,  655373ULL,  786433ULL,  917521ULL,
+    1048583ULL, 1179653ULL, 1310729ULL, 1441801ULL, 1572869ULL, 1703941ULL,
+    1835017ULL, 1966087ULL, 2097169ULL, 2228243ULL, 2359319ULL, 2490389ULL,
+    2621471ULL, 2752549ULL, 2883617ULL, 3014687ULL, 3145757ULL, 3276833ULL,
+    3407903ULL, 3538973ULL,
+};
+
+static const uint64_t PAIR_MIX = 1000003ULL;
+static const uint64_t PREFIX_BASE = 1099511628211ULL;
+static const uint64_t LEN_MIX = 0x9E3779B185EBCA87ULL;
+static const uint64_t TABLE_MIX = 0x9e3779b97f4a7c15ULL;
+
+typedef struct {
+    uint64_t key;
+    uint32_t total;
+    uint32_t top_count;
+    uint16_t top_tok;
+    uint16_t _pad;
+} CtxBucket;
+
+typedef struct {
+    uint64_t key;
+    uint32_t count;
+    uint32_t _pad;
+} PairBucket;
+
+typedef struct {
+    int token_ctx_len;
+    int token_prefix_len;
+    int token_head;
+    uint16_t *token_ring;
+
+    CtxBucket *token_ctx_tbl;
+    uint8_t *token_ctx_used;
+    size_t token_ctx_mask;
+
+    PairBucket *token_pair_tbl;
+    uint8_t *token_pair_used;
+    size_t token_pair_mask;
+
+    uint64_t within_hash;
+    uint32_t within_len;
+
+    CtxBucket *within_ctx_tbl;
+    uint8_t *within_ctx_used;
+    size_t within_ctx_mask;
+
+    PairBucket *within_pair_tbl;
+    uint8_t *within_pair_used;
+    size_t within_pair_mask;
+} OnlineNgramState;
+
+static inline size_t mix_index(uint64_t key, size_t mask) {
+    return (size_t)((key * TABLE_MIX) & mask);
+}
+
+static inline size_t find_ctx_slot(
+    CtxBucket *tbl,
+    uint8_t *used,
+    size_t mask,
+    uint64_t key,
+    int *found
+) {
+    size_t idx = mix_index(key, mask);
+    for (size_t probe = 0; probe <= mask; ++probe) {
+        if (!used[idx]) {
+            *found = 0;
+            return idx;
+        }
+        if (tbl[idx].key == key) {
+            *found = 1;
+            return idx;
+        }
+        idx = (idx + 1U) & mask;
+    }
+    *found = -1;
+    return 0;
+}
+
+static inline size_t find_pair_slot(
+    PairBucket *tbl,
+    uint8_t *used,
+    size_t mask,
+    uint64_t key,
+    int *found
+) {
+    size_t idx = mix_index(key, mask);
+    for (size_t probe = 0; probe <= mask; ++probe) {
+        if (!used[idx]) {
+            *found = 0;
+            return idx;
+        }
+        if (tbl[idx].key == key) {
+            *found = 1;
+            return idx;
+        }
+        idx = (idx + 1U) & mask;
+    }
+    *found = -1;
+    return 0;
+}
+
+static inline uint64_t token_pair_key(uint64_t ctx_key, uint16_t tok, int ctx_len) {
+    return (ctx_key * PAIR_MIX) ^ (((uint64_t)tok) * ROLLING_COEFFS[(size_t)ctx_len % COEFF_COUNT]);
+}
+
+static inline uint64_t within_pair_key(uint64_t ctx_key, uint16_t tok) {
+    return (ctx_key * PAIR_MIX) ^ (((uint64_t)tok) * ROLLING_COEFFS[0]);
+}
+
+static inline uint64_t extend_prefix_hash(uint64_t current_hash, uint16_t tok, uint32_t pos) {
+    return (current_hash * PREFIX_BASE) ^ (((uint64_t)tok + 1ULL) * ROLLING_COEFFS[(size_t)pos % COEFF_COUNT]);
+}
+
+static inline uint32_t pair_increment(
+    PairBucket *tbl,
+    uint8_t *used,
+    size_t mask,
+    uint64_t key
+) {
+    int found = 0;
+    size_t idx = find_pair_slot(tbl, used, mask, key, &found);
+    if (found < 0) {
+        return 0U;
+    }
+    if (!found) {
+        used[idx] = 1U;
+        tbl[idx].key = key;
+        tbl[idx].count = 1U;
+        return 1U;
+    }
+    tbl[idx].count += 1U;
+    return tbl[idx].count;
+}
+
+static inline int ctx_increment(
+    CtxBucket *tbl,
+    uint8_t *used,
+    size_t mask,
+    uint64_t key,
+    uint16_t tok,
+    uint32_t pair_count
+) {
+    int found = 0;
+    size_t idx = find_ctx_slot(tbl, used, mask, key, &found);
+    if (found < 0) {
+        return -1;
+    }
+    if (!found) {
+        used[idx] = 1U;
+        tbl[idx].key = key;
+        tbl[idx].total = 1U;
+        tbl[idx].top_count = pair_count;
+        tbl[idx].top_tok = tok;
+        return 0;
+    }
+    tbl[idx].total += 1U;
+    if (pair_count > tbl[idx].top_count) {
+        tbl[idx].top_count = pair_count;
+        tbl[idx].top_tok = tok;
+    }
+    return 0;
+}
+
+static inline uint64_t token_context_hash(const OnlineNgramState *st) {
+    uint64_t h = 0ULL;
+    if (st->token_ctx_len <= 0) {
+        return h;
+    }
+    for (int j = 0; j < st->token_ctx_len; ++j) {
+        const int ring_idx = (st->token_head + j) % st->token_ctx_len;
+        h ^= ((uint64_t)st->token_ring[ring_idx]) * ROLLING_COEFFS[(size_t)j];
+    }
+    return h;
+}
+
+static inline void token_push(OnlineNgramState *st, uint16_t tok) {
+    if (st->token_ctx_len <= 0) {
+        return;
+    }
+    if (st->token_prefix_len < st->token_ctx_len) {
+        st->token_ring[st->token_prefix_len] = tok;
+        st->token_prefix_len += 1;
+        return;
+    }
+    st->token_ring[st->token_head] = tok;
+    st->token_head = (st->token_head + 1) % st->token_ctx_len;
+}
+
+static void *xcalloc(size_t count, size_t size) {
+    if (count == 0 || size == 0) {
+        return NULL;
+    }
+    return calloc(count, size);
+}
+
+static int alloc_tables(
+    size_t table_bits,
+    CtxBucket **ctx_tbl,
+    uint8_t **ctx_used,
+    size_t *ctx_mask,
+    PairBucket **pair_tbl,
+    uint8_t **pair_used,
+    size_t *pair_mask
+) {
+    const size_t size = 1ULL << table_bits;
+    *ctx_tbl = (CtxBucket *)xcalloc(size, sizeof(CtxBucket));
+    *ctx_used = (uint8_t *)xcalloc(size, sizeof(uint8_t));
+    *pair_tbl = (PairBucket *)xcalloc(size, sizeof(PairBucket));
+    *pair_used = (uint8_t *)xcalloc(size, sizeof(uint8_t));
+    if (!*ctx_tbl || !*ctx_used || !*pair_tbl || !*pair_used) {
+        return -1;
+    }
+    *ctx_mask = size - 1U;
+    *pair_mask = size - 1U;
+    return 0;
+}
+
+void *online_ngram_state_create(
+    int token_ctx_len,
+    int token_table_bits,
+    int within_table_bits
+) {
+    if (token_ctx_len < 0 || token_table_bits <= 0 || within_table_bits <= 0) {
+        return NULL;
+    }
+    OnlineNgramState *st = (OnlineNgramState *)calloc(1, sizeof(OnlineNgramState));
+    if (!st) {
+        return NULL;
+    }
+    st->token_ctx_len = token_ctx_len;
+    if (token_ctx_len > 0) {
+        st->token_ring = (uint16_t *)xcalloc((size_t)token_ctx_len, sizeof(uint16_t));
+        if (!st->token_ring) {
+            free(st);
+            return NULL;
+        }
+    }
+    if (alloc_tables(
+            (size_t)token_table_bits,
+            &st->token_ctx_tbl,
+            &st->token_ctx_used,
+            &st->token_ctx_mask,
+            &st->token_pair_tbl,
+            &st->token_pair_used,
+            &st->token_pair_mask
+        ) != 0) {
+        free(st->token_ring);
+        free(st);
+        return NULL;
+    }
+    if (alloc_tables(
+            (size_t)within_table_bits,
+            &st->within_ctx_tbl,
+            &st->within_ctx_used,
+            &st->within_ctx_mask,
+            &st->within_pair_tbl,
+            &st->within_pair_used,
+            &st->within_pair_mask
+        ) != 0) {
+        free(st->token_pair_used);
+        free(st->token_pair_tbl);
+        free(st->token_ctx_used);
+        free(st->token_ctx_tbl);
+        free(st->token_ring);
+        free(st);
+        return NULL;
+    }
+    return (void *)st;
+}
+
+void online_ngram_state_destroy(void *ptr) {
+    OnlineNgramState *st = (OnlineNgramState *)ptr;
+    if (!st) {
+        return;
+    }
+    free(st->within_pair_used);
+    free(st->within_pair_tbl);
+    free(st->within_ctx_used);
+    free(st->within_ctx_tbl);
+    free(st->token_pair_used);
+    free(st->token_pair_tbl);
+    free(st->token_ctx_used);
+    free(st->token_ctx_tbl);
+    free(st->token_ring);
+    free(st);
+}
+
+void online_ngram_state_seed_prefix_token(void *ptr, uint16_t tok) {
+    OnlineNgramState *st = (OnlineNgramState *)ptr;
+    if (!st) {
+        return;
+    }
+    token_push(st, tok);
+}
+
+int online_ngram_state_process_chunk(
+    void *ptr,
+    const uint16_t *tokens,
+    int64_t n_tokens,
+    const uint8_t *starts_new_word_lut,
+    const uint8_t *boundary_lut,
+    uint16_t *token_top_token,
+    float *token_top_prob,
+    uint16_t *within_top_token,
+    float *within_top_prob,
+    uint8_t *within_valid
+) {
+    OnlineNgramState *st = (OnlineNgramState *)ptr;
+    if (!st || !tokens || n_tokens < 0) {
+        return -1;
+    }
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        const uint16_t tok = tokens[i];
+        const uint8_t is_boundary = boundary_lut[tok];
+        const uint8_t is_new_word = starts_new_word_lut[tok];
+
+        uint64_t token_ctx_key = 0ULL;
+        if (st->token_ctx_len == 0 || st->token_prefix_len >= st->token_ctx_len) {
+            token_ctx_key = token_context_hash(st);
+            int found = 0;
+            size_t idx = find_ctx_slot(
+                st->token_ctx_tbl,
+                st->token_ctx_used,
+                st->token_ctx_mask,
+                token_ctx_key,
+                &found
+            );
+            if (found > 0) {
+                token_top_token[i] = st->token_ctx_tbl[idx].top_tok;
+                token_top_prob[i] =
+                    (float)st->token_ctx_tbl[idx].top_count / (float)st->token_ctx_tbl[idx].total;
+            } else {
+                token_top_token[i] = 0U;
+                token_top_prob[i] = 0.0f;
+            }
+        } else {
+            token_top_token[i] = 0U;
+            token_top_prob[i] = 0.0f;
+        }
+
+        uint64_t within_ctx_key = 0ULL;
+        if (!is_boundary && !is_new_word && st->within_len > 0U) {
+            within_ctx_key = st->within_hash ^ ((uint64_t)st->within_len * LEN_MIX);
+            int found = 0;
+            size_t idx = find_ctx_slot(
+                st->within_ctx_tbl,
+                st->within_ctx_used,
+                st->within_ctx_mask,
+                within_ctx_key,
+                &found
+            );
+            within_valid[i] = 1U;
+            if (found > 0) {
+                within_top_token[i] = st->within_ctx_tbl[idx].top_tok;
+                within_top_prob[i] =
+                    (float)st->within_ctx_tbl[idx].top_count / (float)st->within_ctx_tbl[idx].total;
+            } else {
+                within_top_token[i] = 0U;
+                within_top_prob[i] = 0.0f;
+            }
+        } else {
+            within_valid[i] = 0U;
+            within_top_token[i] = 0U;
+            within_top_prob[i] = 0.0f;
+        }
+
+        if (st->token_ctx_len == 0 || st->token_prefix_len >= st->token_ctx_len) {
+            const uint64_t pair_key = token_pair_key(token_ctx_key, tok, st->token_ctx_len);
+            const uint32_t pair_count = pair_increment(
+                st->token_pair_tbl,
+                st->token_pair_used,
+                st->token_pair_mask,
+                pair_key
+            );
+            if (pair_count == 0U) {
+                return -2;
+            }
+            if (ctx_increment(
+                    st->token_ctx_tbl,
+                    st->token_ctx_used,
+                    st->token_ctx_mask,
+                    token_ctx_key,
+                    tok,
+                    pair_count
+                ) != 0) {
+                return -3;
+            }
+        }
+        token_push(st, tok);
+
+        if (is_boundary) {
+            st->within_hash = 0ULL;
+            st->within_len = 0U;
+            continue;
+        }
+        if (is_new_word || st->within_len == 0U) {
+            st->within_hash = extend_prefix_hash(0ULL, tok, 0U);
+            st->within_len = 1U;
+            continue;
+        }
+        const uint32_t within_pair_count = pair_increment(
+            st->within_pair_tbl,
+            st->within_pair_used,
+            st->within_pair_mask,
+            within_pair_key(within_ctx_key, tok)
+        );
+        if (within_pair_count == 0U) {
+            return -4;
+        }
+        if (ctx_increment(
+                st->within_ctx_tbl,
+                st->within_ctx_used,
+                st->within_ctx_mask,
+                within_ctx_key,
+                tok,
+                within_pair_count
+            ) != 0) {
+            return -5;
+        }
+        st->within_hash = extend_prefix_hash(st->within_hash, tok, st->within_len);
+        st->within_len += 1U;
+    }
+    return 0;
+}
+
+int online_ngram_state_process_chunk_token_only(
+    void *ptr,
+    const uint16_t *tokens,
+    int64_t n_tokens,
+    uint16_t *token_top_token,
+    float *token_top_prob
+) {
+    OnlineNgramState *st = (OnlineNgramState *)ptr;
+    if (!st || !tokens || n_tokens < 0) {
+        return -1;
+    }
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        const uint16_t tok = tokens[i];
+
+        uint64_t token_ctx_key = 0ULL;
+        if (st->token_ctx_len == 0 || st->token_prefix_len >= st->token_ctx_len) {
+            token_ctx_key = token_context_hash(st);
+            int found = 0;
+            size_t idx = find_ctx_slot(
+                st->token_ctx_tbl,
+                st->token_ctx_used,
+                st->token_ctx_mask,
+                token_ctx_key,
+                &found
+            );
+            if (found > 0) {
+                token_top_token[i] = st->token_ctx_tbl[idx].top_tok;
+                token_top_prob[i] =
+                    (float)st->token_ctx_tbl[idx].top_count / (float)st->token_ctx_tbl[idx].total;
+            } else {
+                token_top_token[i] = 0U;
+                token_top_prob[i] = 0.0f;
+            }
+
+            const uint64_t pair_key = token_pair_key(token_ctx_key, tok, st->token_ctx_len);
+            const uint32_t pair_count = pair_increment(
+                st->token_pair_tbl,
+                st->token_pair_used,
+                st->token_pair_mask,
+                pair_key
+            );
+            if (pair_count == 0U) {
+                return -2;
+            }
+            if (ctx_increment(
+                    st->token_ctx_tbl,
+                    st->token_ctx_used,
+                    st->token_ctx_mask,
+                    token_ctx_key,
+                    tok,
+                    pair_count
+                ) != 0) {
+                return -3;
+            }
+        } else {
+            token_top_token[i] = 0U;
+            token_top_prob[i] = 0.0f;
+        }
+        token_push(st, tok);
+    }
+    return 0;
+}
+
+"""
+_ONLINE_NGRAM_LIB_CACHE = None
+
+WHITESPACE_BYTE_IDS = {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 36}
+EDGE_PUNCT = ".,:;!?()[]{}<>\"'`"
+
+
+def normalize_word(text: str, mode: str) -> str:
+    text = text.strip()
+    if mode == "lower":
+        return text.lower()
+    if mode == "identity":
+        return text
+    if mode == "strip_punct_lower":
+        return text.strip(EDGE_PUNCT).lower()
+    raise ValueError(f"Unknown word normalization mode: {mode}")
+
+
+def suggest_table_bits(expected_entries: int, load_factor: float) -> int:
+    if expected_entries <= 0:
+        return 16
+    target = max(int(expected_entries / max(load_factor, 1e-6)), 1)
+    bits = max(int(math.ceil(math.log2(target))), 12)
+    return min(bits, 28)
+
+
+def ensure_online_ngram_lib(log0=print) -> ctypes.CDLL:
+    global _ONLINE_NGRAM_LIB_CACHE
+    if _ONLINE_NGRAM_LIB_CACHE is not None:
+        return _ONLINE_NGRAM_LIB_CACHE
+    build_dir = Path(os.environ.get("PG_NGRAM_BUILD_DIR", "/tmp"))
+    build_dir.mkdir(parents=True, exist_ok=True)
+    lib_path = build_dir / f"pg_online_ngram_state_{os.getpid()}.so"
+    if not lib_path.exists():
+        tmp_lib = lib_path.with_suffix(f".tmp.{os.getpid()}.so")
+        log0("ngram_tilt:building_embedded_native_helper")
+        subprocess.run(
+            [
+                "gcc", "-O3", "-march=native", "-std=c11", "-shared", "-fPIC",
+                "-x", "c", "-", "-o", str(tmp_lib),
+            ],
+            input=_ONLINE_NGRAM_STATE_C.encode("utf-8"),
+            check=True,
+        )
+        os.replace(tmp_lib, lib_path)
+    lib = ctypes.CDLL(str(lib_path))
+    lib.online_ngram_state_create.restype = ctypes.c_void_p
+    lib.online_ngram_state_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.online_ngram_state_destroy.restype = None
+    lib.online_ngram_state_destroy.argtypes = [ctypes.c_void_p]
+    lib.online_ngram_state_seed_prefix_token.restype = None
+    lib.online_ngram_state_seed_prefix_token.argtypes = [ctypes.c_void_p, ctypes.c_uint16]
+    lib.online_ngram_state_process_chunk.restype = ctypes.c_int
+    lib.online_ngram_state_process_chunk.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    lib.online_ngram_state_process_chunk_token_only.restype = ctypes.c_int
+    lib.online_ngram_state_process_chunk_token_only.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    _ONLINE_NGRAM_LIB_CACHE = lib
+    return lib
+
+class OnlineNgramState:
+    def __init__(
+        self, *, lib, token_ctx_len, token_table_bits, within_table_bits,
+        starts_new_word_lut, boundary_lut, seed_prefix_token,
+    ):
+        self.lib = lib
+        self.state = lib.online_ngram_state_create(token_ctx_len, token_table_bits, within_table_bits)
+        if not self.state:
+            raise RuntimeError(
+                f"Native ngram state alloc failed token_table_bits={token_table_bits} within_table_bits={within_table_bits}"
+            )
+        self.starts_new_word_lut = np.ascontiguousarray(starts_new_word_lut.astype(np.uint8, copy=False))
+        self.boundary_lut = np.ascontiguousarray(boundary_lut.astype(np.uint8, copy=False))
+        self.lib.online_ngram_state_seed_prefix_token(self.state, ctypes.c_uint16(int(seed_prefix_token)))
+
+    def close(self):
+        if self.state:
+            self.lib.online_ngram_state_destroy(self.state)
+            self.state = None
+
+    def __del__(self):
+        self.close()
+
+    def process_chunk(self, chunk_tokens):
+        chunk_tokens = np.ascontiguousarray(chunk_tokens.astype(np.uint16, copy=False))
+        n = int(chunk_tokens.size)
+        token_top_token = np.zeros(n, dtype=np.uint16)
+        token_top_prob = np.zeros(n, dtype=np.float32)
+        within_top_token = np.zeros(n, dtype=np.uint16)
+        within_top_prob = np.zeros(n, dtype=np.float32)
+        within_valid = np.zeros(n, dtype=np.uint8)
+        rc = self.lib.online_ngram_state_process_chunk(
+            self.state,
+            chunk_tokens.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            ctypes.c_int64(n),
+            self.starts_new_word_lut.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            self.boundary_lut.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            token_top_token.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            token_top_prob.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            within_top_token.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            within_top_prob.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            within_valid.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        )
+        if rc != 0:
+            raise RuntimeError(f"Native ngram process_chunk failed rc={rc}")
+        return token_top_token, token_top_prob, within_top_token, within_top_prob, within_valid.astype(bool)
+
+    def process_chunk_token_only(self, chunk_tokens):
+        chunk_tokens = np.ascontiguousarray(chunk_tokens.astype(np.uint16, copy=False))
+        n = int(chunk_tokens.size)
+        token_top_token = np.zeros(n, dtype=np.uint16)
+        token_top_prob = np.zeros(n, dtype=np.float32)
+        rc = self.lib.online_ngram_state_process_chunk_token_only(
+            self.state,
+            chunk_tokens.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            ctypes.c_int64(n),
+            token_top_token.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            token_top_prob.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        if rc != 0:
+            raise RuntimeError(f"Native ngram token-only process_chunk failed rc={rc}")
+        return token_top_token, token_top_prob
+
+
+class WordStartState:
+    def __init__(self, *, sp, order, normalize_mode):
+        self.sp = sp
+        self.ctx_w = max(order - 1, 0)
+        self.normalize_mode = normalize_mode
+        self.prev_word_ids = collections.deque(maxlen=self.ctx_w)
+        self.current_word_tokens: list = []
+        self.word_to_id: dict = {}
+        self.next_word_id = 1
+        self.ctx_total: dict = {}
+        self.pair_count: dict = {}
+        self.ctx_best_token: dict = {}
+        self.ctx_best_count: dict = {}
+
+    def _flush_current_word(self):
+        if not self.current_word_tokens:
+            return
+        text = normalize_word(self.sp.decode(self.current_word_tokens), self.normalize_mode)
+        if text:
+            wid = self.word_to_id.get(text)
+            if wid is None:
+                wid = self.next_word_id
+                self.word_to_id[text] = wid
+                self.next_word_id += 1
+            if self.ctx_w > 0:
+                self.prev_word_ids.append(wid)
+        self.current_word_tokens = []
+
+    def process_chunk(self, chunk_tokens, *, starts_new_word_lut, boundary_lut):
+        chunk_tokens = np.ascontiguousarray(chunk_tokens.astype(np.uint16, copy=False))
+        top_token = np.zeros(chunk_tokens.size, dtype=np.uint16)
+        top_prob = np.zeros(chunk_tokens.size, dtype=np.float32)
+        for i, tok_u16 in enumerate(chunk_tokens):
+            tok = int(tok_u16)
+            is_boundary = bool(boundary_lut[tok])
+            is_word_start = bool(starts_new_word_lut[tok]) or not self.current_word_tokens
+            if is_boundary:
+                self._flush_current_word()
+                continue
+            if bool(starts_new_word_lut[tok]):
+                self._flush_current_word()
+            ctx_key = None
+            if is_word_start and len(self.prev_word_ids) >= self.ctx_w:
+                ctx_key = tuple(self.prev_word_ids) if self.ctx_w > 0 else ()
+                total = self.ctx_total.get(ctx_key, 0)
+                if total > 0:
+                    top_token[i] = np.uint16(self.ctx_best_token[ctx_key])
+                    top_prob[i] = np.float32(self.ctx_best_count[ctx_key] / total)
+            if is_word_start:
+                if ctx_key is not None:
+                    pair_key = (ctx_key, tok)
+                    pair = self.pair_count.get(pair_key, 0) + 1
+                    self.pair_count[pair_key] = pair
+                    total = self.ctx_total.get(ctx_key, 0) + 1
+                    self.ctx_total[ctx_key] = total
+                    best_count = self.ctx_best_count.get(ctx_key, 0)
+                    if pair > best_count:
+                        self.ctx_best_count[ctx_key] = pair
+                        self.ctx_best_token[ctx_key] = tok
+                self.current_word_tokens = [tok]
+            else:
+                self.current_word_tokens.append(tok)
+        return top_token, top_prob
+
+
+def build_piece_luts(*, tokenizer_path, vocab_size):
+    sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
+    pieces = [sp.id_to_piece(i) for i in range(sp.vocab_size())]
+    starts_new_word_lut = np.zeros(vocab_size, dtype=np.uint8)
+    for i, piece in enumerate(pieces):
+        starts_new_word_lut[i] = 1 if piece.startswith("▁") else 0
+    boundary_lut = np.zeros(vocab_size, dtype=np.uint8)
+    bos_id = sp.bos_id()
+    if bos_id >= 0 and bos_id < vocab_size:
+        boundary_lut[bos_id] = 1
+    for tok in range(min(sp.vocab_size(), vocab_size)):
+        if sp.is_byte(tok) and tok in WHITESPACE_BYTE_IDS:
+            boundary_lut[tok] = 1
+    return sp, starts_new_word_lut, boundary_lut
+
+
+def build_hints_for_targets(
+    *, target_token_ids_np, tokenizer_path, vocab_size, log0=print,
+    token_order=16, token_threshold=0.800, token_boost=2.625,
+    within_tau=999.0, within_boost=0.0,
+    word_order=4, word_normalize="strip_punct_lower",
+    word_tau=999.0, word_boost=0.0,
+    agree_add_boost=0.0,
+    seed_prefix_token=None,
+):
+    """Single L->R pass. Returns dict with hint_ids, gate_mask, boost_per_pos.
+
+    target_token_ids_np: np.uint16 array of realized targets (length = total_targets).
+    Output arrays are aligned to target_token_ids_np indexing.
+
+    For each scored position t we pick at most one hint h_t:
+      - prefer the expert with highest expected gain = p_top * boost - log1p(p_top * (exp(boost)-1))
+      - if multiple experts agree on the same h_t, additive boost agree_add_boost
+      - gate (don't tilt) when no expert clears its threshold
+
+    The realized loss formula used by the caller:
+      ptl' = ptl - beta * 1[y == h_t] + log1p(q_t * (exp(beta) - 1))   when gate_mask == True
+      ptl' = ptl                                                        when gate_mask == False
+    """
+    sp, starts_new_word_lut, boundary_lut = build_piece_luts(
+        tokenizer_path=tokenizer_path, vocab_size=vocab_size
+    )
+    total = int(target_token_ids_np.size)
+    if total == 0:
+        return {
+            "hint_ids":   np.zeros(0, dtype=np.int64),
+            "gate_mask":  np.zeros(0, dtype=bool),
+            "boost":      np.zeros(0, dtype=np.float32),
+            "sp":         sp,
+            "starts_new_word_lut": starts_new_word_lut,
+            "boundary_lut": boundary_lut,
+        }
+
+    token_table_bits = suggest_table_bits(total, load_factor=0.55)
+    within_table_bits = suggest_table_bits(max(total // 2, 1), load_factor=0.60)
+    token_only = (
+        float(within_boost) == 0.0
+        and float(word_boost) == 0.0
+    )
+    online_lib = ensure_online_ngram_lib(log0)
+    ngram_state = OnlineNgramState(
+        lib=online_lib,
+        token_ctx_len=max(token_order - 1, 0),
+        token_table_bits=token_table_bits,
+        within_table_bits=1 if token_only else within_table_bits,
+        starts_new_word_lut=starts_new_word_lut,
+        boundary_lut=boundary_lut,
+        seed_prefix_token=int(target_token_ids_np[0] if seed_prefix_token is None else seed_prefix_token),
+    )
+    if token_only:
+        token_top_tok, token_top_prob = ngram_state.process_chunk_token_only(target_token_ids_np)
+        token_gate = token_top_prob >= np.float32(token_threshold)
+        hint_ids = np.where(token_gate, token_top_tok.astype(np.int64), 0).astype(np.int64)
+        boost = np.where(token_gate, np.float32(token_boost), np.float32(0.0)).astype(np.float32)
+        log0(
+            f"ngram_tilt:hints total={total} gated={int(token_gate.sum())} "
+            f"token_gate={int(token_gate.sum())} within_gate=0 word_gate=0 agree2plus=0"
+        )
+        return {
+            "hint_ids":   hint_ids,
+            "gate_mask":  token_gate,
+            "boost":      boost,
+            "sp":         sp,
+            "starts_new_word_lut": starts_new_word_lut,
+            "boundary_lut": boundary_lut,
+        }
+    word_state = WordStartState(sp=sp, order=word_order, normalize_mode=word_normalize)
+
+    token_top_tok, token_top_prob, within_top_tok, within_top_prob, within_valid = (
+        ngram_state.process_chunk(target_token_ids_np)
+    )
+    word_top_tok, word_top_prob = word_state.process_chunk(
+        target_token_ids_np,
+        starts_new_word_lut=starts_new_word_lut,
+        boundary_lut=boundary_lut,
+    )
+
+    def _expected_gain(p_top, boost):
+        # E[ -log p'(y) under -log p(y)] when y ~ p
+        # = p_top * boost - log1p(p_top * (exp(boost) - 1))
+        # Maximizing this over experts => pick the most informative hint.
+        log_norm = np.log1p(p_top * (math.exp(boost) - 1.0))
+        return p_top * boost - log_norm
+
+    token_gate = token_top_prob >= np.float32(token_threshold)
+    within_gate = within_valid & (within_top_prob >= np.float32(within_tau))
+    word_gate = word_top_prob >= np.float32(word_tau)
+
+    token_gain = np.where(token_gate, _expected_gain(token_top_prob.astype(np.float64), token_boost), -np.inf)
+    within_gain = np.where(within_gate, _expected_gain(within_top_prob.astype(np.float64), within_boost), -np.inf)
+    word_gain = np.where(word_gate, _expected_gain(word_top_prob.astype(np.float64), word_boost), -np.inf)
+
+    stack = np.stack([token_gain, within_gain, word_gain], axis=1)
+    best_idx = np.argmax(stack, axis=1)
+    best_gain = np.max(stack, axis=1)
+    any_gate = best_gain > -np.inf
+
+    hint_ids = np.zeros(total, dtype=np.int64)
+    boost = np.zeros(total, dtype=np.float32)
+    base_boost_per_expert = np.array([token_boost, within_boost, word_boost], dtype=np.float32)
+    hint_per_expert = np.stack([
+        token_top_tok.astype(np.int64),
+        within_top_tok.astype(np.int64),
+        word_top_tok.astype(np.int64),
+    ], axis=1)
+
+    rows = np.arange(total)
+    hint_ids[any_gate] = hint_per_expert[rows[any_gate], best_idx[any_gate]]
+    boost[any_gate] = base_boost_per_expert[best_idx[any_gate]]
+
+    # Agreement bonus: if 2+ experts agree on the same hint as best, add agree_add_boost
+    gate_mask_each = np.stack([token_gate, within_gate, word_gate], axis=1)
+    expert_hints = hint_per_expert.copy()
+    expert_hints[~gate_mask_each] = -1
+    agreements = (expert_hints == hint_ids[:, None]).sum(axis=1)
+    agreement_extra = np.where(agreements >= 2, np.float32(agree_add_boost), np.float32(0.0))
+    boost = (boost + agreement_extra).astype(np.float32)
+
+    log0(
+        f"ngram_tilt:hints total={total} gated={int(any_gate.sum())} "
+        f"token_gate={int(token_gate.sum())} within_gate={int(within_gate.sum())} word_gate={int(word_gate.sum())} "
+        f"agree2plus={int((agreements >= 2).sum())}"
+    )
+
+    return {
+        "hint_ids":   hint_ids,
+        "gate_mask":  any_gate,
+        "boost":      boost,
+        "sp":         sp,
+        "starts_new_word_lut": starts_new_word_lut,
+        "boundary_lut": boundary_lut,
+    }
+
+
+def apply_tilt_to_ptl_torch(
+    ptl: torch.Tensor,
+    log_q_hint: torch.Tensor,
+    target_ids: torch.Tensor,
+    hint_ids: torch.Tensor,
+    gate_mask: torch.Tensor,
+    boost: torch.Tensor,
+):
+    """Closed-form tilt applied to per-token NLL.
+
+    All tensors same shape [..., L].
+        ptl_tilted = ptl - beta * 1[y == h] + log1p(q * (exp(beta) - 1))   if gate else ptl
+    """
+    boost64 = boost.to(torch.float64)
+    q = log_q_hint.to(torch.float64).clamp_(max=0.0).exp()
+    is_hit = (target_ids == hint_ids).to(torch.float64)
+    log_Z = torch.log1p(q * (torch.expm1(boost64)))
+    ptl_tilted = ptl.to(torch.float64) - boost64 * is_hit + log_Z
+    return torch.where(gate_mask, ptl_tilted, ptl.to(torch.float64)).to(ptl.dtype)
+
+
+def apply_tilt_to_ptl_torch_fast(
+    ptl: torch.Tensor,
+    log_q_hint: torch.Tensor,
+    target_ids: torch.Tensor,
+    hint_ids: torch.Tensor,
+    gate_mask: torch.Tensor,
+    boost: torch.Tensor,
+):
+    """fp32 variant of apply_tilt — cast removed where safe.
+
+    BPB downstream accumulator is fp64, so per-token tilt computation in
+    fp32 has no impact on final precision. Saves ~10-15s per eval pass on
+    H100 (avoids fp64 ALU + double memory traffic).
+    """
+    boost32 = boost.to(torch.float32)
+    q = log_q_hint.to(torch.float32).clamp_(max=0.0).exp()
+    is_hit = (target_ids == hint_ids).to(torch.float32)
+    log_Z = torch.log1p(q * (torch.expm1(boost32)))
+    ptl_f32 = ptl.to(torch.float32)
+    ptl_tilted = ptl_f32 - boost32 * is_hit + log_Z
+    return torch.where(gate_mask, ptl_tilted, ptl_f32).to(ptl.dtype)
+
+# ===== End inlined online n-gram tilt helpers =====
 
 
 # ===== Fused softcapped cross-entropy (Triton) — training-only path =====
@@ -280,6 +1188,17 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-08))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    # Mudskipper v1: cheap CPU-side online data triage. This only changes
+    # training batch construction; model, optimizer, quantization, and eval
+    # remain the submission stack.
+    mudskipper_scout = bool(int(os.environ.get("MUDSKIPPER_SCOUT", "0")))
+    mudskipper_scout_fraction = float(os.environ.get("MUDSKIPPER_SCOUT_FRACTION", "0.125"))
+    mudskipper_candidate_mult = float(os.environ.get("MUDSKIPPER_CANDIDATE_MULT", "1.25"))
+    mudskipper_vocab_size = int(os.environ.get("MUDSKIPPER_VOCAB_SIZE", vocab_size))
+    mudskipper_bucket_count = int(os.environ.get("MUDSKIPPER_BUCKET_COUNT", "16"))
+    mudskipper_recent_hashes = int(os.environ.get("MUDSKIPPER_RECENT_HASHES", "8192"))
+    mudskipper_log_every = int(os.environ.get("MUDSKIPPER_LOG_EVERY", train_log_every))
+    mudskipper_nvidia_smi = bool(int(os.environ.get("MUDSKIPPER_NVIDIA_SMI", "0")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     adam_wd = float(os.environ.get("ADAM_WD", 0.02))
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
@@ -383,7 +1302,7 @@ class Hyperparameters:
     awq_lite_group_size = int(os.environ.get("AWQ_LITE_GROUP_SIZE", "64"))
     # PR #1145 online n-gram tilt (AnirudhRahul, valerio-endorsed). Causal,
     # normalized, prefix-only token expert; closed-form multiplicative-boost-with-renorm
-    # applied to per-token NLL. See online_ngram_tilt.py for math + compliance.
+    # applied to per-token NLL. See inlined n-gram helpers above for math + compliance.
     ngram_tilt_enabled = bool(int(os.environ.get("NGRAM_TILT_ENABLED", "0")))
     token_order = int(os.environ.get("TOKEN_ORDER", "16"))
     token_threshold = float(os.environ.get("TOKEN_THRESHOLD", "0.800"))
@@ -663,15 +1582,144 @@ def _build_cu_seqlens(bos_pos, total_len, device, max_doc_len=0, bucket_size=64)
     max_seqlen = max(end - start for start, end in zip(seg_starts, seg_ends))
     return cu, max_seqlen
 
+
+class MudskipperScout:
+    def __init__(self, h):
+        self.vocab_size = max(int(h.mudskipper_vocab_size), 2)
+        self.bucket_count = max(int(h.mudskipper_bucket_count), 1)
+        self.recent_hash_limit = max(int(h.mudskipper_recent_hashes), 0)
+        self.counts = np.ones(self.vocab_size, dtype=np.float64)
+        self.total = float(self.vocab_size)
+        self.bucket_seen = np.ones(self.bucket_count, dtype=np.float64)
+        self.recent_hashes = {}
+
+    def _token_array(self, window):
+        arr = window[:-1].numpy().astype(np.int64, copy=False)
+        if arr.size == 0:
+            return arr
+        return np.clip(arr, 0, self.vocab_size - 1)
+
+    def _fingerprint(self, arr):
+        if arr.size == 0:
+            return 0
+        stride = max(1, arr.size // 64)
+        h = 1469598103934665603
+        for v in arr[::stride][:64].tolist():
+            h ^= int(v) + 0x9E3779B97F4A7C15
+            h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        return h
+
+    def _bucket(self, arr, rare_frac, unique_ratio):
+        if arr.size == 0:
+            return 0
+        token_level = float(arr.mean()) / max(self.vocab_size - 1, 1)
+        raw = 0.50 * token_level + 0.30 * rare_frac + 0.20 * unique_ratio
+        return int(min(self.bucket_count - 1, max(0, math.floor(raw * self.bucket_count))))
+
+    def score_windows(self, windows):
+        rows = []
+        nlls = np.empty(len(windows), dtype=np.float64)
+        for i, window in enumerate(windows):
+            arr = self._token_array(window)
+            if arr.size == 0:
+                nll = math.log(self.vocab_size)
+                unique_ratio = 0.0
+                max_frac = 1.0
+                repeat_frac = 1.0
+                rare_frac = 0.0
+            else:
+                probs = self.counts[arr] / self.total
+                nll = float(-np.log(probs + 1e-12).mean())
+                binc = np.bincount(arr, minlength=self.vocab_size)
+                unique_ratio = int(np.count_nonzero(binc)) / float(arr.size)
+                max_frac = float(binc.max()) / float(arr.size)
+                repeat_frac = float(np.mean(arr[1:] == arr[:-1])) if arr.size > 1 else 0.0
+                rare_frac = float(np.mean(self.counts[arr] <= 2.0))
+            bucket = self._bucket(arr, rare_frac, unique_ratio)
+            fp = self._fingerprint(arr)
+            recent_hit = fp in self.recent_hashes
+            junk = unique_ratio < 0.04 or max_frac > 0.45 or repeat_frac > 0.35
+            rows.append(
+                {
+                    "idx": i,
+                    "nll": nll,
+                    "rare_frac": rare_frac,
+                    "max_frac": max_frac,
+                    "repeat_frac": repeat_frac,
+                    "bucket": bucket,
+                    "fp": fp,
+                    "recent_hit": recent_hit,
+                    "junk": junk,
+                }
+            )
+            nlls[i] = nll
+        if not rows:
+            return []
+        order = np.argsort(nlls)
+        ranks = np.empty(len(rows), dtype=np.float64)
+        ranks[order] = np.linspace(0.0, 1.0, num=len(rows), endpoint=True) if len(rows) > 1 else 0.5
+        scored = []
+        for row in rows:
+            idx = int(row["idx"])
+            # Same v1 heuristic: prefer medium-high CPU surprise, avoid the
+            # pathological tail, add mild coverage/rarity pressure.
+            surprise = max(0.0, 1.0 - abs(float(ranks[idx]) - 0.70) / 0.70)
+            bucket = int(row["bucket"])
+            coverage = 1.0 / math.sqrt(float(self.bucket_seen[bucket]))
+            score = (
+                0.65 * surprise
+                + 0.20 * float(row["rare_frac"])
+                + 0.15 * coverage
+                - 0.35 * float(row["max_frac"])
+                - 0.25 * float(row["repeat_frac"])
+            )
+            if bool(row["recent_hit"]):
+                score -= 0.25
+            if bool(row["junk"]):
+                score -= 1.0
+            scored.append((score, bucket, bool(row["junk"]), int(row["fp"])))
+        return scored
+
+    def update(self, windows, scored):
+        for window, (_, bucket, _, fp) in zip(windows, scored, strict=True):
+            arr = self._token_array(window)
+            if arr.size:
+                self.counts += np.bincount(arr, minlength=self.vocab_size)
+                self.total += float(arr.size)
+            self.bucket_seen[bucket] += 1.0
+            if self.recent_hash_limit > 0:
+                self.recent_hashes[fp] = None
+                while len(self.recent_hashes) > self.recent_hash_limit:
+                    self.recent_hashes.pop(next(iter(self.recent_hashes)))
+
+
 class DocumentPackingLoader:
     _shard_pool = ThreadPoolExecutor(1)
 
     def __init__(self, h, device, cu_bucket_size=64):
+        self.args = h
         self.rank = h.rank
         self.world_size = h.world_size
         self.device = device
         self.cu_bucket_size = cu_bucket_size
         self.max_seq_len = h.train_seq_len
+        self.scout_enabled = bool(h.mudskipper_scout)
+        self.scout_fraction = min(max(float(h.mudskipper_scout_fraction), 0.0), 0.95)
+        self.candidate_mult = max(float(h.mudskipper_candidate_mult), 1.0)
+        self.scout = MudskipperScout(h) if self.scout_enabled else None
+        self.stats = {
+            "batches": 0,
+            "candidates": 0,
+            "accepted_base": 0,
+            "accepted_scout": 0,
+            "skipped": 0,
+            "junk_candidates": 0,
+            "fallback": 0,
+            "stream_ms": 0.0,
+            "score_ms": 0.0,
+            "update_ms": 0.0,
+            "h2d_ms": 0.0,
+        }
         all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
         if not all_files:
             raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
@@ -714,7 +1762,44 @@ class DocumentPackingLoader:
         hi = np.searchsorted(self.bos_idx, local_start + total_len, side="left")
         return (self.bos_idx[lo:hi] - local_start).tolist()
 
+    def _take_candidate_windows(self, num_windows, seq_len):
+        total = num_windows * seq_len + 1
+        while self.cursor + total > self.shard_size:
+            self._advance_shard()
+        block = self.tokens[self.cursor : self.cursor + total]
+        self.cursor += total
+        return [block[i * seq_len : i * seq_len + seq_len + 1] for i in range(num_windows)]
+
+    def _window_doc_starts(self, windows, seq_len):
+        starts = []
+        offset = 0
+        for window in windows:
+            starts.append(offset)
+            rel_bos = (window[:-1] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+            for pos in rel_bos.tolist():
+                if pos > 0:
+                    starts.append(offset + int(pos))
+            offset += seq_len
+        return sorted(set(starts))
+
+    def _pack_windows(self, windows, max_seq_len):
+        total_len = len(windows) * max_seq_len
+        inputs = torch.empty(total_len, dtype=torch.int64, pin_memory=True)
+        targets = torch.empty(total_len, dtype=torch.int64, pin_memory=True)
+        pos = 0
+        for window in windows:
+            nxt = pos + max_seq_len
+            inputs[pos:nxt].copy_(window[:-1])
+            targets[pos:nxt].copy_(window[1:])
+            pos = nxt
+        starts = self._window_doc_starts(windows, max_seq_len)
+        cu_seqlens, max_seqlen = _build_cu_seqlens(
+            starts, inputs.numel(), inputs.device, max_seq_len, self.cu_bucket_size
+        )
+        return inputs, targets, cu_seqlens.pin_memory(), max_seqlen
+
     def _prepare_batch(self, num_tokens_local, max_seq_len):
+        t_stream = time.perf_counter()
         per_rank_span = num_tokens_local + 1
         global_span = per_rank_span * self.world_size
         while self.cursor + global_span > self.shard_size:
@@ -731,21 +1816,176 @@ class DocumentPackingLoader:
         )
         cu_seqlens = cu_seqlens.pin_memory()
         self.cursor += global_span
+        self.stats["stream_ms"] += 1000.0 * (time.perf_counter() - t_stream)
+        self.stats["batches"] += 1
+        return inputs, targets, cu_seqlens, max_seqlen
+
+    def _prepare_scout_batch(self, num_tokens_local, max_seq_len):
+        assert self.scout is not None
+        if num_tokens_local % max_seq_len != 0:
+            self.stats["fallback"] += 1
+            return self._prepare_batch(num_tokens_local, max_seq_len)
+        num_seqs = num_tokens_local // max_seq_len
+        if num_seqs <= 0:
+            self.stats["fallback"] += 1
+            return self._prepare_batch(num_tokens_local, max_seq_len)
+        global_num_seqs = num_seqs * self.world_size
+        scout_take = int(round(global_num_seqs * self.scout_fraction))
+        scout_take = min(max(scout_take, 0), max(global_num_seqs - 1, 0))
+        base_take = global_num_seqs - scout_take
+        if scout_take == 0:
+            candidate_count = global_num_seqs
+        else:
+            candidate_count = max(
+                global_num_seqs + scout_take,
+                int(math.ceil(global_num_seqs * self.candidate_mult)),
+            )
+
+        t_stream = time.perf_counter()
+        candidates = self._take_candidate_windows(candidate_count, max_seq_len)
+        self.stats["stream_ms"] += 1000.0 * (time.perf_counter() - t_stream)
+
+        accepted = []
+        base_windows = candidates[:base_take]
+        if base_windows:
+            t_score = time.perf_counter()
+            base_scores = self.scout.score_windows(base_windows)
+            self.stats["score_ms"] += 1000.0 * (time.perf_counter() - t_score)
+            accepted.extend(
+                (i, w, s) for i, (w, s) in enumerate(zip(base_windows, base_scores, strict=True))
+            )
+        if scout_take > 0:
+            pool = candidates[base_take:]
+            t_score = time.perf_counter()
+            scored_pool = self.scout.score_windows(pool)
+            self.stats["score_ms"] += 1000.0 * (time.perf_counter() - t_score)
+            ranked = sorted(range(len(pool)), key=lambda i: scored_pool[i][0], reverse=True)
+            selected = sorted(ranked[:scout_take])
+            accepted.extend((base_take + i, pool[i], scored_pool[i]) for i in selected)
+            self.stats["junk_candidates"] += sum(1 for _, _, junk, _ in scored_pool if junk)
+
+        accepted.sort(key=lambda x: x[0])
+        accepted_windows = [w for _, w, _ in accepted]
+        accepted_scores = [s for _, _, s in accepted]
+
+        t_update = time.perf_counter()
+        self.scout.update(accepted_windows, accepted_scores)
+        self.stats["update_ms"] += 1000.0 * (time.perf_counter() - t_update)
+
+        local_windows = accepted_windows[self.rank :: self.world_size]
+        inputs, targets, cu_seqlens, max_seqlen = self._pack_windows(local_windows, max_seq_len)
+        self.stats["batches"] += 1
+        self.stats["candidates"] += candidate_count
+        self.stats["accepted_base"] += base_take
+        self.stats["accepted_scout"] += scout_take
+        self.stats["skipped"] += max(0, candidate_count - global_num_seqs)
         return inputs, targets, cu_seqlens, max_seqlen
 
     def next_batch(self, global_tokens, grad_accum_steps):
         num_tokens_local = global_tokens // (self.world_size * grad_accum_steps)
+        prepare_fn = self._prepare_scout_batch if self.scout_enabled else self._prepare_batch
         while len(self._prefetch_queue) < 2:
             self._prefetch_queue.append(
-                self._batch_pool.submit(self._prepare_batch, num_tokens_local, self.max_seq_len))
+                self._batch_pool.submit(prepare_fn, num_tokens_local, self.max_seq_len))
         inputs, targets, cu_seqlens, max_seqlen = self._prefetch_queue.pop(0).result()
         self._prefetch_queue.append(
-            self._batch_pool.submit(self._prepare_batch, num_tokens_local, self.max_seq_len))
+            self._batch_pool.submit(prepare_fn, num_tokens_local, self.max_seq_len))
+        t_h2d = time.perf_counter()
+        inputs = inputs[None].to(self.device, non_blocking=True)
+        targets = targets[None].to(self.device, non_blocking=True)
+        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        self.stats["h2d_ms"] += 1000.0 * (time.perf_counter() - t_h2d)
         return (
-            inputs[None].to(self.device, non_blocking=True),
-            targets[None].to(self.device, non_blocking=True),
-            cu_seqlens.to(self.device, non_blocking=True),
+            inputs,
+            targets,
+            cu_seqlens,
             max_seqlen,
+        )
+
+    def stats_line(self, reset=False):
+        s = self.stats.copy()
+        batches = max(int(s["batches"]), 1)
+        line = (
+            f"mudskipper scout:{int(self.scout_enabled)} batches:{int(s['batches'])} "
+            f"cand:{int(s['candidates'])} base:{int(s['accepted_base'])} "
+            f"scout:{int(s['accepted_scout'])} skipped:{int(s['skipped'])} "
+            f"junk:{int(s['junk_candidates'])} fallback:{int(s['fallback'])} "
+            f"stream_ms/b:{s['stream_ms'] / batches:.2f} score_ms/b:{s['score_ms'] / batches:.2f} "
+            f"update_ms/b:{s['update_ms'] / batches:.2f} h2d_ms/b:{s['h2d_ms'] / batches:.2f}"
+        )
+        if reset:
+            for key in self.stats:
+                self.stats[key] = 0.0 if key.endswith("_ms") else 0
+        return line
+
+
+class ResourceMonitor:
+    def __init__(self, h, device):
+        self.h = h
+        self.device = device
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        self.last_wall = time.perf_counter()
+        self.last_cpu = ru.ru_utime + ru.ru_stime
+
+    def _rss_mib(self, raw):
+        # macOS reports bytes; Linux reports KiB.
+        return raw / (1024.0 * 1024.0) if sys.platform == "darwin" else raw / 1024.0
+
+    def _nvidia_smi_line(self):
+        if not self.h.mudskipper_nvidia_smi:
+            return "gpu_smi:off"
+        cmd = [
+            "nvidia-smi",
+            "-i",
+            str(self.h.local_rank),
+            "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            out = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=0.35, check=False,
+            )
+        except Exception as exc:
+            return f"gpu_smi:err:{type(exc).__name__}"
+        line = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
+        if not line:
+            return "gpu_smi:na"
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 6:
+            return f"gpu_smi:{line}"
+        return (
+            f"gpu_util:{parts[0]}% gpu_mem_util:{parts[1]}% "
+            f"gpu_mem:{parts[2]}/{parts[3]}MiB gpu_power:{parts[4]}W gpu_temp:{parts[5]}C"
+        )
+
+    def snapshot_line(self):
+        now = time.perf_counter()
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        cpu_time = ru.ru_utime + ru.ru_stime
+        dt = max(now - self.last_wall, 1e-9)
+        cpu_dt = max(cpu_time - self.last_cpu, 0.0)
+        self.last_wall = now
+        self.last_cpu = cpu_time
+        cpu_pct_one_core = 100.0 * cpu_dt / dt
+        cpu_pct_total = cpu_pct_one_core / max(os.cpu_count() or 1, 1)
+        try:
+            load1, load5, load15 = os.getloadavg()
+            load = f"load:{load1:.2f}/{load5:.2f}/{load15:.2f}"
+        except OSError:
+            load = "load:na"
+        alloc = torch.cuda.memory_allocated(self.device) // 1024 // 1024
+        reserved = torch.cuda.memory_reserved(self.device) // 1024 // 1024
+        peak = torch.cuda.max_memory_allocated(self.device) // 1024 // 1024
+        try:
+            cuda_util = f"cuda_util:{torch.cuda.utilization(self.device)}%"
+        except Exception:
+            cuda_util = "cuda_util:na"
+        rss = self._rss_mib(int(ru.ru_maxrss))
+        return (
+            f"resources proc_cpu:{cpu_pct_one_core:.1f}% total_cpu:{cpu_pct_total:.1f}% "
+            f"rss_peak:{rss:.0f}MiB {load} cuda_mem:{alloc}MiB "
+            f"cuda_reserved:{reserved}MiB cuda_peak:{peak}MiB {cuda_util} {self._nvidia_smi_line()}"
         )
 
 
@@ -3500,7 +4740,6 @@ def _compute_ngram_hints_for_val(h, val_data, log0=print):
     """
     if not getattr(h, "ngram_tilt_enabled", False):
         return None
-    from online_ngram_tilt import build_hints_for_targets
     all_tokens = val_data.val_tokens
     targets_np_all = all_tokens.cpu().numpy().astype("uint16", copy=False)[1:]
     t_h0 = time.perf_counter()
@@ -3519,6 +4758,7 @@ def _compute_ngram_hints_for_val(h, val_data, log0=print):
         word_tau=h.word_tau,
         word_boost=h.word_boost,
         agree_add_boost=h.agree_add_boost,
+        seed_prefix_token=int(all_tokens[0].item()),
     )
     hint_global = torch.from_numpy(hints_pkg["hint_ids"].astype("int64"))
     gate_global = torch.from_numpy(hints_pkg["gate_mask"])
@@ -3555,7 +4795,6 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
             f"total_targets={ngram_hint_global.numel()} (precompute time excluded from eval)"
         )
     elif getattr(h, "ngram_tilt_enabled", False):
-        from online_ngram_tilt import build_hints_for_targets
         targets_np_all = all_tokens.cpu().numpy().astype("uint16", copy=False)[1:]
         t_h0 = time.perf_counter()
         hints_pkg = build_hints_for_targets(
@@ -3573,6 +4812,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
             word_tau=h.word_tau,
             word_boost=h.word_boost,
             agree_add_boost=h.agree_add_boost,
+            seed_prefix_token=int(all_tokens[0].item()),
         )
         ngram_hint_global = torch.from_numpy(hints_pkg["hint_ids"].astype("int64"))
         ngram_gate_global = torch.from_numpy(hints_pkg["gate_mask"])
@@ -3761,8 +5001,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
             # but keep original per_tok_loss for TTT-LoRA backward (training
             # objective is base NLL — tilt is a scoring-time overlay).
             if hint_ids_gpu is not None and log_q_hint is not None:
-                from online_ngram_tilt import apply_tilt_to_ptl_torch_fast as apply_tilt_to_ptl_torch
-                tilted_loss = apply_tilt_to_ptl_torch(
+                tilted_loss = apply_tilt_to_ptl_torch_fast(
                     ptl=per_tok_loss,
                     log_q_hint=log_q_hint,
                     target_ids=y,
@@ -3933,6 +5172,15 @@ def train_model(h, device, val_data):
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
     optimizers = Optimizers(h, base_model)
     train_loader = DocumentPackingLoader(h, device)
+    resource_monitor = ResourceMonitor(h, device)
+    log(
+        f"mudskipper_scout:{int(h.mudskipper_scout)} "
+        f"scout_fraction:{h.mudskipper_scout_fraction:.4f} "
+        f"candidate_mult:{h.mudskipper_candidate_mult:.3f} "
+        f"bucket_count:{h.mudskipper_bucket_count} "
+        f"recent_hashes:{h.mudskipper_recent_hashes} "
+        f"nvidia_smi:{int(h.mudskipper_nvidia_smi)}"
+    )
     max_wallclock_ms = (
         1e3 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
     )
@@ -4116,14 +5364,20 @@ def train_model(h, device, val_data):
                 ema_t.mul_(ema_decay).add_(t.detach(), alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
-        should_log_train = h.train_log_every > 0 and (
-            step <= 5 or step % h.train_log_every == 0 or stop_after_step is not None
+        should_log_train = (
+            h.train_log_every > 0
+            and (step <= 5 or step % h.train_log_every == 0 or stop_after_step is not None)
+        ) or (
+            h.mudskipper_log_every > 0
+            and (step <= 5 or step % h.mudskipper_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
             tok_per_sec = step * h.train_batch_tokens / (approx_training_time_ms / 1e3)
             log(
                 f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
             )
+            log(train_loader.stats_line(reset=True))
+            log(resource_monitor.snapshot_line())
         reached_cap = (
             forced_stop_step <= 0
             and max_wallclock_ms is not None

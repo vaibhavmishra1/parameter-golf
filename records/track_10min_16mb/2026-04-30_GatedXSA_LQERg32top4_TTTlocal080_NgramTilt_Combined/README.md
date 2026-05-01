@@ -71,6 +71,7 @@ vs current merged SOTA (PR #1855: 1.06108 BPB) → expected gain **≈ −0.014 
 | `WARMDOWN_FRAC` | 0.75 | PR #2018 |
 | `GRAD_CLIP_NORM` | 0.3 | PR #2018 |
 | Train wallclock cap | 600s | rules |
+| `MUDSKIPPER_SCOUT` | **1**, fraction=0.125, candidate_mult=1.25 | local v1 CPU-side batch triage |
 
 ### Quantization (PR #2018 stack + PR #2060 LQER tuning)
 
@@ -129,15 +130,18 @@ PR #2060 uses `PHASED_TTT_NUM_PHASES=3` and `PHASED_TTT_PREFIX_DOCS=3000` becaus
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt
-sudo apt-get install -y build-essential lrzip   # for online_ngram_state.c + pergroup compressor
+sudo apt-get install -y build-essential lrzip   # for embedded native n-gram helper + pergroup compressor
 
 # 2. Prepare CaseOps-tokenized dataset
-python prepare_caseops_data.py --local-dir ./data
+python prepare_caseops_data.py
 
 # 3. Run a seed (3 seeds recommended for statistical significance)
 SEED=42   ./run.sh
 SEED=0    ./run.sh
 SEED=1234 ./run.sh
+
+# Control run with the same script but no Mudskipper triage
+MUDSKIPPER_SCOUT=0 SEED=42 ./run.sh
 ```
 
 ## Lineage

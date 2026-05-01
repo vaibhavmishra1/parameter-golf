@@ -19,17 +19,29 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SEED="${SEED:-42}"
 RUN_ID="${RUN_ID:-combined_gxsa_lqerg32top4_ngram_seed${SEED}}"
 
 # ── Data / tokenizer (CaseOps SP8192 lossless-caps) ──────────────────────────
-DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-./tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model}"
+DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp8192_caseops/datasets/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-${SCRIPT_DIR}/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model}"
 
 # ── Compute budget ───────────────────────────────────────────────────────────
 ITERATIONS=20000
 MAX_WALLCLOCK_SECONDS=600
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+
+# ── Mudskipper v1 CPU-side batch triage ──────────────────────────────────────
+# Keeps the same model/optimizer/eval stack, but uses CPU scoring to replace a
+# small slice of each training batch with higher-priority candidate windows.
+MUDSKIPPER_SCOUT="${MUDSKIPPER_SCOUT:-1}"
+MUDSKIPPER_SCOUT_FRACTION="${MUDSKIPPER_SCOUT_FRACTION:-0.125}"
+MUDSKIPPER_CANDIDATE_MULT="${MUDSKIPPER_CANDIDATE_MULT:-1.25}"
+MUDSKIPPER_BUCKET_COUNT="${MUDSKIPPER_BUCKET_COUNT:-16}"
+MUDSKIPPER_RECENT_HASHES="${MUDSKIPPER_RECENT_HASHES:-8192}"
+MUDSKIPPER_LOG_EVERY="${MUDSKIPPER_LOG_EVERY:-${TRAIN_LOG_EVERY:-500}}"
+MUDSKIPPER_NVIDIA_SMI="${MUDSKIPPER_NVIDIA_SMI:-0}"
 
 # ─── PORTED FROM PR #2060 (the 4 knobs PR #2018's code actually honors) ──────
 # These are the LQER quantization tweaks that PR #2060 used on its V21/LongCtx
@@ -87,6 +99,9 @@ VOCAB_SIZE=8192
 # ─────────────────────────────────────────────────────────────────────────────
 export SEED RUN_ID DATA_PATH TOKENIZER_PATH \
        ITERATIONS MAX_WALLCLOCK_SECONDS \
+       MUDSKIPPER_SCOUT MUDSKIPPER_SCOUT_FRACTION \
+       MUDSKIPPER_CANDIDATE_MULT MUDSKIPPER_BUCKET_COUNT \
+       MUDSKIPPER_RECENT_HASHES MUDSKIPPER_LOG_EVERY MUDSKIPPER_NVIDIA_SMI \
        MATRIX_LR LQER_RANK LQER_ASYM_GROUP LQER_TOP_K \
        GATED_XSA SKYLIGHT_MUON \
        NGRAM_TILT_ENABLED NGRAM_HINT_PRECOMPUTE_OUTSIDE \
@@ -102,4 +117,4 @@ export SEED RUN_ID DATA_PATH TOKENIZER_PATH \
        GPTQ_RESERVE_SECONDS GPTQ_CALIBRATION_BATCHES \
        COMPRESSOR CASEOPS_ENABLED VOCAB_SIZE
 
-torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" train_gpt.py
+torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" "${SCRIPT_DIR}/train_gpt.py"
