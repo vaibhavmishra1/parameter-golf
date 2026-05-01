@@ -93,9 +93,11 @@ class Hyperparameters:
     engram_buckets = int(os.environ.get("ENGRAM_BUCKETS", 65536))
     engram_max_table_bytes = int(os.environ.get("ENGRAM_MAX_TABLE_BYTES", 536_870_912))
     engram_alpha = float(os.environ.get("ENGRAM_ALPHA", 4.0))
-    engram_max_weight = float(os.environ.get("ENGRAM_MAX_WEIGHT", 0.35))
-    engram_count_scale = float(os.environ.get("ENGRAM_COUNT_SCALE", 16.0))
-    engram_min_count = int(os.environ.get("ENGRAM_MIN_COUNT", 2))
+    engram_max_weight = float(os.environ.get("ENGRAM_MAX_WEIGHT", 0.03))
+    engram_count_scale = float(os.environ.get("ENGRAM_COUNT_SCALE", 128.0))
+    engram_min_count = int(os.environ.get("ENGRAM_MIN_COUNT", 16))
+    engram_conf_floor = float(os.environ.get("ENGRAM_CONF_FLOOR", 0.20))
+    engram_weight_power = float(os.environ.get("ENGRAM_WEIGHT_POWER", 2.0))
     engram_eval_tokens = int(os.environ.get("ENGRAM_EVAL_TOKENS", 0))
     eval_only = bool(int(os.environ.get("EVAL_ONLY", os.environ.get("SKIP_TRAINING", "0"))))
     eval_model_path = os.environ.get("EVAL_MODEL_PATH", os.environ.get("INT8_MODEL_PATH", "final_model.int8.ptz"))
@@ -295,7 +297,18 @@ def eval_val(
 class OnlineEngramLite:
     # Fixed-size hashed n-gram memory. For each prefix key, it stores an online
     # next-token histogram. It is score-first: update happens after scoring.
-    def __init__(self, vocab_size: int, order: int, buckets: int, alpha: float, max_weight: float, count_scale: float, min_count: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        order: int,
+        buckets: int,
+        alpha: float,
+        max_weight: float,
+        count_scale: float,
+        min_count: int,
+        conf_floor: float,
+        weight_power: float,
+    ):
         self.vocab_size = vocab_size
         self.order = max(order, 1)
         self.buckets = max(1, buckets)
@@ -303,6 +316,8 @@ class OnlineEngramLite:
         self.max_weight = min(max(max_weight, 0.0), 1.0)
         self.count_scale = max(count_scale, 1e-9)
         self.min_count = max(min_count, 0)
+        self.conf_floor = min(max(conf_floor, 0.0), 0.99)
+        self.weight_power = max(weight_power, 1e-9)
         self.token_bits = max(1, (vocab_size - 1).bit_length())
         self.key_mask = (1 << (self.token_bits * self.order)) - 1
         self.bucket_mask = self.buckets - 1
@@ -310,9 +325,11 @@ class OnlineEngramLite:
         self.hist_len = 0
         self.total = np.zeros((self.buckets,), dtype=np.uint32)
         self.next_counts = np.zeros((self.buckets, vocab_size), dtype=np.uint32)
+        self.max_next_count = np.zeros((self.buckets,), dtype=np.uint32)
         self.unigram = np.zeros((vocab_size,), dtype=np.uint32)
         self.unigram_total = 0
         self.used_weight_sum = 0.0
+        self.conf_sum = 0.0
         self.hit_count = 0
         self.active_count = 0
 
@@ -340,17 +357,25 @@ class OnlineEngramLite:
             unigram_prob = 1.0 / self.vocab_size
         mem_prob = (pair_count + self.alpha * unigram_prob) / (key_total + self.alpha)
         weight = 0.0
+        confidence = 0.0
         if key_total >= self.min_count:
-            weight = self.max_weight * key_total / (key_total + self.count_scale)
-            self.active_count += 1
+            top_mass = int(self.max_next_count[b]) / max(key_total, 1)
+            confidence = max((top_mass - self.conf_floor) / (1.0 - self.conf_floor), 0.0)
+            confidence = confidence ** self.weight_power
+            if confidence > 0.0:
+                weight = self.max_weight * key_total / (key_total + self.count_scale) * confidence
+                self.active_count += 1
         if pair_count > 0:
             self.hit_count += 1
         self.used_weight_sum += weight
+        self.conf_sum += confidence
         prob = (1.0 - weight) * max(float(neural_prob), 1e-45) + weight * max(float(mem_prob), 1e-45)
         if self.total[b] < np.iinfo(np.uint32).max:
             self.total[b] += 1
         if self.next_counts[b, target] < np.iinfo(np.uint32).max:
             self.next_counts[b, target] += 1
+            if self.next_counts[b, target] > self.max_next_count[b]:
+                self.max_next_count[b] = self.next_counts[b, target]
         if self.unigram[target] < np.iinfo(np.uint32).max:
             self.unigram[target] += 1
             self.unigram_total += 1
@@ -388,6 +413,8 @@ def eval_val_online_engram(
         max_weight=args.engram_max_weight,
         count_scale=args.engram_count_scale,
         min_count=args.engram_min_count,
+        conf_floor=args.engram_conf_floor,
+        weight_power=args.engram_weight_power,
     )
     local_batch_tokens = max(args.val_batch_size // max(world_size * grad_accum_steps, 1), args.train_seq_len)
     local_batch_seqs = max(local_batch_tokens // args.train_seq_len, 1)
@@ -441,6 +468,7 @@ def eval_val_online_engram(
         "hit_rate": engram.hit_count / max(token_count, 1),
         "active_rate": engram.active_count / max(token_count, 1),
         "avg_weight": engram.used_weight_sum / max(token_count, 1),
+        "avg_conf": engram.conf_sum / max(token_count, 1),
     }
     model.train()
     return nn_loss, nn_loss / math.log(2.0) * tokens_per_byte, engram_loss, engram_loss / math.log(2.0) * tokens_per_byte, stats
@@ -1070,6 +1098,7 @@ def main() -> None:
                 f"order:{args.engram_order} buckets:{int(engram_stats['buckets'])} "
                 f"alpha:{args.engram_alpha:.4g} max_weight:{args.engram_max_weight:.4g} "
                 f"count_scale:{args.engram_count_scale:.4g} min_count:{args.engram_min_count} "
+                f"conf_floor:{args.engram_conf_floor:.4g} weight_power:{args.engram_weight_power:.4g} "
                 f"eval_tokens:{int(engram_stats['tokens'])}"
             )
             log0(f"{prefix}_nn_replay_exact val_loss:{nn_loss:.8f} val_bpb:{nn_bpb:.8f}")
@@ -1077,6 +1106,7 @@ def main() -> None:
                 f"{prefix}_exact val_loss:{engram_loss:.8f} val_bpb:{engram_bpb:.8f} "
                 f"delta_bpb:{engram_bpb - nn_bpb:+.8f} hit_rate:{engram_stats['hit_rate']:.4f} "
                 f"active_rate:{engram_stats['active_rate']:.4f} avg_weight:{engram_stats['avg_weight']:.4f} "
+                f"avg_conf:{engram_stats['avg_conf']:.4f} "
                 f"bytes:{int(engram_stats['bytes'])} eval_time:{1000.0 * (time.perf_counter() - t_engram):.0f}ms"
             )
 
