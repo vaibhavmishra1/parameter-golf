@@ -71,7 +71,6 @@ vs current merged SOTA (PR #1855: 1.06108 BPB) → expected gain **≈ −0.014 
 | `WARMDOWN_FRAC` | 0.75 | PR #2018 |
 | `GRAD_CLIP_NORM` | 0.3 | PR #2018 |
 | Train wallclock cap | 600s | rules |
-| `MUDSKIPPER_SCOUT` | **1**, fraction=0.125, candidate_mult=1.25 | local v1 CPU-side batch triage |
 
 ### Quantization (PR #2018 stack + PR #2060 LQER tuning)
 
@@ -139,9 +138,6 @@ python prepare_caseops_data.py
 SEED=42   ./run.sh
 SEED=0    ./run.sh
 SEED=1234 ./run.sh
-
-# Control run with the same script but no Mudskipper triage
-MUDSKIPPER_SCOUT=0 SEED=42 ./run.sh
 ```
 
 ## Lineage

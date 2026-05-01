@@ -1,4 +1,4 @@
-import base64, collections, copy, ctypes, fcntl, glob, io, lzma, math, os, resource
+import base64, collections, copy, ctypes, fcntl, glob, io, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import Tensor, nn
@@ -1188,17 +1188,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-08))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
-    # Mudskipper v1: cheap CPU-side online data triage. This only changes
-    # training batch construction; model, optimizer, quantization, and eval
-    # remain the submission stack.
-    mudskipper_scout = bool(int(os.environ.get("MUDSKIPPER_SCOUT", "0")))
-    mudskipper_scout_fraction = float(os.environ.get("MUDSKIPPER_SCOUT_FRACTION", "0.125"))
-    mudskipper_candidate_mult = float(os.environ.get("MUDSKIPPER_CANDIDATE_MULT", "1.25"))
-    mudskipper_vocab_size = int(os.environ.get("MUDSKIPPER_VOCAB_SIZE", vocab_size))
-    mudskipper_bucket_count = int(os.environ.get("MUDSKIPPER_BUCKET_COUNT", "16"))
-    mudskipper_recent_hashes = int(os.environ.get("MUDSKIPPER_RECENT_HASHES", "8192"))
-    mudskipper_log_every = int(os.environ.get("MUDSKIPPER_LOG_EVERY", train_log_every))
-    mudskipper_nvidia_smi = bool(int(os.environ.get("MUDSKIPPER_NVIDIA_SMI", "0")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     adam_wd = float(os.environ.get("ADAM_WD", 0.02))
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
@@ -1583,143 +1572,15 @@ def _build_cu_seqlens(bos_pos, total_len, device, max_doc_len=0, bucket_size=64)
     return cu, max_seqlen
 
 
-class MudskipperScout:
-    def __init__(self, h):
-        self.vocab_size = max(int(h.mudskipper_vocab_size), 2)
-        self.bucket_count = max(int(h.mudskipper_bucket_count), 1)
-        self.recent_hash_limit = max(int(h.mudskipper_recent_hashes), 0)
-        self.counts = np.ones(self.vocab_size, dtype=np.float64)
-        self.total = float(self.vocab_size)
-        self.bucket_seen = np.ones(self.bucket_count, dtype=np.float64)
-        self.recent_hashes = {}
-
-    def _token_array(self, window):
-        arr = window[:-1].numpy().astype(np.int64, copy=False)
-        if arr.size == 0:
-            return arr
-        return np.clip(arr, 0, self.vocab_size - 1)
-
-    def _fingerprint(self, arr):
-        if arr.size == 0:
-            return 0
-        stride = max(1, arr.size // 64)
-        h = 1469598103934665603
-        for v in arr[::stride][:64].tolist():
-            h ^= int(v) + 0x9E3779B97F4A7C15
-            h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
-        return h
-
-    def _bucket(self, arr, rare_frac, unique_ratio):
-        if arr.size == 0:
-            return 0
-        token_level = float(arr.mean()) / max(self.vocab_size - 1, 1)
-        raw = 0.50 * token_level + 0.30 * rare_frac + 0.20 * unique_ratio
-        return int(min(self.bucket_count - 1, max(0, math.floor(raw * self.bucket_count))))
-
-    def score_windows(self, windows):
-        rows = []
-        nlls = np.empty(len(windows), dtype=np.float64)
-        for i, window in enumerate(windows):
-            arr = self._token_array(window)
-            if arr.size == 0:
-                nll = math.log(self.vocab_size)
-                unique_ratio = 0.0
-                max_frac = 1.0
-                repeat_frac = 1.0
-                rare_frac = 0.0
-            else:
-                probs = self.counts[arr] / self.total
-                nll = float(-np.log(probs + 1e-12).mean())
-                binc = np.bincount(arr, minlength=self.vocab_size)
-                unique_ratio = int(np.count_nonzero(binc)) / float(arr.size)
-                max_frac = float(binc.max()) / float(arr.size)
-                repeat_frac = float(np.mean(arr[1:] == arr[:-1])) if arr.size > 1 else 0.0
-                rare_frac = float(np.mean(self.counts[arr] <= 2.0))
-            bucket = self._bucket(arr, rare_frac, unique_ratio)
-            fp = self._fingerprint(arr)
-            recent_hit = fp in self.recent_hashes
-            junk = unique_ratio < 0.04 or max_frac > 0.45 or repeat_frac > 0.35
-            rows.append(
-                {
-                    "idx": i,
-                    "nll": nll,
-                    "rare_frac": rare_frac,
-                    "max_frac": max_frac,
-                    "repeat_frac": repeat_frac,
-                    "bucket": bucket,
-                    "fp": fp,
-                    "recent_hit": recent_hit,
-                    "junk": junk,
-                }
-            )
-            nlls[i] = nll
-        if not rows:
-            return []
-        order = np.argsort(nlls)
-        ranks = np.empty(len(rows), dtype=np.float64)
-        ranks[order] = np.linspace(0.0, 1.0, num=len(rows), endpoint=True) if len(rows) > 1 else 0.5
-        scored = []
-        for row in rows:
-            idx = int(row["idx"])
-            # Same v1 heuristic: prefer medium-high CPU surprise, avoid the
-            # pathological tail, add mild coverage/rarity pressure.
-            surprise = max(0.0, 1.0 - abs(float(ranks[idx]) - 0.70) / 0.70)
-            bucket = int(row["bucket"])
-            coverage = 1.0 / math.sqrt(float(self.bucket_seen[bucket]))
-            score = (
-                0.65 * surprise
-                + 0.20 * float(row["rare_frac"])
-                + 0.15 * coverage
-                - 0.35 * float(row["max_frac"])
-                - 0.25 * float(row["repeat_frac"])
-            )
-            if bool(row["recent_hit"]):
-                score -= 0.25
-            if bool(row["junk"]):
-                score -= 1.0
-            scored.append((score, bucket, bool(row["junk"]), int(row["fp"])))
-        return scored
-
-    def update(self, windows, scored):
-        for window, (_, bucket, _, fp) in zip(windows, scored, strict=True):
-            arr = self._token_array(window)
-            if arr.size:
-                self.counts += np.bincount(arr, minlength=self.vocab_size)
-                self.total += float(arr.size)
-            self.bucket_seen[bucket] += 1.0
-            if self.recent_hash_limit > 0:
-                self.recent_hashes[fp] = None
-                while len(self.recent_hashes) > self.recent_hash_limit:
-                    self.recent_hashes.pop(next(iter(self.recent_hashes)))
-
-
 class DocumentPackingLoader:
     _shard_pool = ThreadPoolExecutor(1)
 
     def __init__(self, h, device, cu_bucket_size=64):
-        self.args = h
         self.rank = h.rank
         self.world_size = h.world_size
         self.device = device
         self.cu_bucket_size = cu_bucket_size
         self.max_seq_len = h.train_seq_len
-        self.scout_enabled = bool(h.mudskipper_scout)
-        self.scout_fraction = min(max(float(h.mudskipper_scout_fraction), 0.0), 0.95)
-        self.candidate_mult = max(float(h.mudskipper_candidate_mult), 1.0)
-        self.scout = MudskipperScout(h) if self.scout_enabled else None
-        self.stats = {
-            "batches": 0,
-            "candidates": 0,
-            "accepted_base": 0,
-            "accepted_scout": 0,
-            "skipped": 0,
-            "junk_candidates": 0,
-            "fallback": 0,
-            "stream_ms": 0.0,
-            "score_ms": 0.0,
-            "update_ms": 0.0,
-            "h2d_ms": 0.0,
-        }
         all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
         if not all_files:
             raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
@@ -1762,44 +1623,7 @@ class DocumentPackingLoader:
         hi = np.searchsorted(self.bos_idx, local_start + total_len, side="left")
         return (self.bos_idx[lo:hi] - local_start).tolist()
 
-    def _take_candidate_windows(self, num_windows, seq_len):
-        total = num_windows * seq_len + 1
-        while self.cursor + total > self.shard_size:
-            self._advance_shard()
-        block = self.tokens[self.cursor : self.cursor + total]
-        self.cursor += total
-        return [block[i * seq_len : i * seq_len + seq_len + 1] for i in range(num_windows)]
-
-    def _window_doc_starts(self, windows, seq_len):
-        starts = []
-        offset = 0
-        for window in windows:
-            starts.append(offset)
-            rel_bos = (window[:-1] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
-            for pos in rel_bos.tolist():
-                if pos > 0:
-                    starts.append(offset + int(pos))
-            offset += seq_len
-        return sorted(set(starts))
-
-    def _pack_windows(self, windows, max_seq_len):
-        total_len = len(windows) * max_seq_len
-        inputs = torch.empty(total_len, dtype=torch.int64, pin_memory=True)
-        targets = torch.empty(total_len, dtype=torch.int64, pin_memory=True)
-        pos = 0
-        for window in windows:
-            nxt = pos + max_seq_len
-            inputs[pos:nxt].copy_(window[:-1])
-            targets[pos:nxt].copy_(window[1:])
-            pos = nxt
-        starts = self._window_doc_starts(windows, max_seq_len)
-        cu_seqlens, max_seqlen = _build_cu_seqlens(
-            starts, inputs.numel(), inputs.device, max_seq_len, self.cu_bucket_size
-        )
-        return inputs, targets, cu_seqlens.pin_memory(), max_seqlen
-
     def _prepare_batch(self, num_tokens_local, max_seq_len):
-        t_stream = time.perf_counter()
         per_rank_span = num_tokens_local + 1
         global_span = per_rank_span * self.world_size
         while self.cursor + global_span > self.shard_size:
@@ -1816,176 +1640,21 @@ class DocumentPackingLoader:
         )
         cu_seqlens = cu_seqlens.pin_memory()
         self.cursor += global_span
-        self.stats["stream_ms"] += 1000.0 * (time.perf_counter() - t_stream)
-        self.stats["batches"] += 1
-        return inputs, targets, cu_seqlens, max_seqlen
-
-    def _prepare_scout_batch(self, num_tokens_local, max_seq_len):
-        assert self.scout is not None
-        if num_tokens_local % max_seq_len != 0:
-            self.stats["fallback"] += 1
-            return self._prepare_batch(num_tokens_local, max_seq_len)
-        num_seqs = num_tokens_local // max_seq_len
-        if num_seqs <= 0:
-            self.stats["fallback"] += 1
-            return self._prepare_batch(num_tokens_local, max_seq_len)
-        global_num_seqs = num_seqs * self.world_size
-        scout_take = int(round(global_num_seqs * self.scout_fraction))
-        scout_take = min(max(scout_take, 0), max(global_num_seqs - 1, 0))
-        base_take = global_num_seqs - scout_take
-        if scout_take == 0:
-            candidate_count = global_num_seqs
-        else:
-            candidate_count = max(
-                global_num_seqs + scout_take,
-                int(math.ceil(global_num_seqs * self.candidate_mult)),
-            )
-
-        t_stream = time.perf_counter()
-        candidates = self._take_candidate_windows(candidate_count, max_seq_len)
-        self.stats["stream_ms"] += 1000.0 * (time.perf_counter() - t_stream)
-
-        accepted = []
-        base_windows = candidates[:base_take]
-        if base_windows:
-            t_score = time.perf_counter()
-            base_scores = self.scout.score_windows(base_windows)
-            self.stats["score_ms"] += 1000.0 * (time.perf_counter() - t_score)
-            accepted.extend(
-                (i, w, s) for i, (w, s) in enumerate(zip(base_windows, base_scores, strict=True))
-            )
-        if scout_take > 0:
-            pool = candidates[base_take:]
-            t_score = time.perf_counter()
-            scored_pool = self.scout.score_windows(pool)
-            self.stats["score_ms"] += 1000.0 * (time.perf_counter() - t_score)
-            ranked = sorted(range(len(pool)), key=lambda i: scored_pool[i][0], reverse=True)
-            selected = sorted(ranked[:scout_take])
-            accepted.extend((base_take + i, pool[i], scored_pool[i]) for i in selected)
-            self.stats["junk_candidates"] += sum(1 for _, _, junk, _ in scored_pool if junk)
-
-        accepted.sort(key=lambda x: x[0])
-        accepted_windows = [w for _, w, _ in accepted]
-        accepted_scores = [s for _, _, s in accepted]
-
-        t_update = time.perf_counter()
-        self.scout.update(accepted_windows, accepted_scores)
-        self.stats["update_ms"] += 1000.0 * (time.perf_counter() - t_update)
-
-        local_windows = accepted_windows[self.rank :: self.world_size]
-        inputs, targets, cu_seqlens, max_seqlen = self._pack_windows(local_windows, max_seq_len)
-        self.stats["batches"] += 1
-        self.stats["candidates"] += candidate_count
-        self.stats["accepted_base"] += base_take
-        self.stats["accepted_scout"] += scout_take
-        self.stats["skipped"] += max(0, candidate_count - global_num_seqs)
         return inputs, targets, cu_seqlens, max_seqlen
 
     def next_batch(self, global_tokens, grad_accum_steps):
         num_tokens_local = global_tokens // (self.world_size * grad_accum_steps)
-        prepare_fn = self._prepare_scout_batch if self.scout_enabled else self._prepare_batch
         while len(self._prefetch_queue) < 2:
             self._prefetch_queue.append(
-                self._batch_pool.submit(prepare_fn, num_tokens_local, self.max_seq_len))
+                self._batch_pool.submit(self._prepare_batch, num_tokens_local, self.max_seq_len))
         inputs, targets, cu_seqlens, max_seqlen = self._prefetch_queue.pop(0).result()
         self._prefetch_queue.append(
-            self._batch_pool.submit(prepare_fn, num_tokens_local, self.max_seq_len))
-        t_h2d = time.perf_counter()
-        inputs = inputs[None].to(self.device, non_blocking=True)
-        targets = targets[None].to(self.device, non_blocking=True)
-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
-        self.stats["h2d_ms"] += 1000.0 * (time.perf_counter() - t_h2d)
+            self._batch_pool.submit(self._prepare_batch, num_tokens_local, self.max_seq_len))
         return (
-            inputs,
-            targets,
-            cu_seqlens,
+            inputs[None].to(self.device, non_blocking=True),
+            targets[None].to(self.device, non_blocking=True),
+            cu_seqlens.to(self.device, non_blocking=True),
             max_seqlen,
-        )
-
-    def stats_line(self, reset=False):
-        s = self.stats.copy()
-        batches = max(int(s["batches"]), 1)
-        line = (
-            f"mudskipper scout:{int(self.scout_enabled)} batches:{int(s['batches'])} "
-            f"cand:{int(s['candidates'])} base:{int(s['accepted_base'])} "
-            f"scout:{int(s['accepted_scout'])} skipped:{int(s['skipped'])} "
-            f"junk:{int(s['junk_candidates'])} fallback:{int(s['fallback'])} "
-            f"stream_ms/b:{s['stream_ms'] / batches:.2f} score_ms/b:{s['score_ms'] / batches:.2f} "
-            f"update_ms/b:{s['update_ms'] / batches:.2f} h2d_ms/b:{s['h2d_ms'] / batches:.2f}"
-        )
-        if reset:
-            for key in self.stats:
-                self.stats[key] = 0.0 if key.endswith("_ms") else 0
-        return line
-
-
-class ResourceMonitor:
-    def __init__(self, h, device):
-        self.h = h
-        self.device = device
-        ru = resource.getrusage(resource.RUSAGE_SELF)
-        self.last_wall = time.perf_counter()
-        self.last_cpu = ru.ru_utime + ru.ru_stime
-
-    def _rss_mib(self, raw):
-        # macOS reports bytes; Linux reports KiB.
-        return raw / (1024.0 * 1024.0) if sys.platform == "darwin" else raw / 1024.0
-
-    def _nvidia_smi_line(self):
-        if not self.h.mudskipper_nvidia_smi:
-            return "gpu_smi:off"
-        cmd = [
-            "nvidia-smi",
-            "-i",
-            str(self.h.local_rank),
-            "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,temperature.gpu",
-            "--format=csv,noheader,nounits",
-        ]
-        try:
-            out = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=0.35, check=False,
-            )
-        except Exception as exc:
-            return f"gpu_smi:err:{type(exc).__name__}"
-        line = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
-        if not line:
-            return "gpu_smi:na"
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 6:
-            return f"gpu_smi:{line}"
-        return (
-            f"gpu_util:{parts[0]}% gpu_mem_util:{parts[1]}% "
-            f"gpu_mem:{parts[2]}/{parts[3]}MiB gpu_power:{parts[4]}W gpu_temp:{parts[5]}C"
-        )
-
-    def snapshot_line(self):
-        now = time.perf_counter()
-        ru = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_time = ru.ru_utime + ru.ru_stime
-        dt = max(now - self.last_wall, 1e-9)
-        cpu_dt = max(cpu_time - self.last_cpu, 0.0)
-        self.last_wall = now
-        self.last_cpu = cpu_time
-        cpu_pct_one_core = 100.0 * cpu_dt / dt
-        cpu_pct_total = cpu_pct_one_core / max(os.cpu_count() or 1, 1)
-        try:
-            load1, load5, load15 = os.getloadavg()
-            load = f"load:{load1:.2f}/{load5:.2f}/{load15:.2f}"
-        except OSError:
-            load = "load:na"
-        alloc = torch.cuda.memory_allocated(self.device) // 1024 // 1024
-        reserved = torch.cuda.memory_reserved(self.device) // 1024 // 1024
-        peak = torch.cuda.max_memory_allocated(self.device) // 1024 // 1024
-        try:
-            cuda_util = f"cuda_util:{torch.cuda.utilization(self.device)}%"
-        except Exception:
-            cuda_util = "cuda_util:na"
-        rss = self._rss_mib(int(ru.ru_maxrss))
-        return (
-            f"resources proc_cpu:{cpu_pct_one_core:.1f}% total_cpu:{cpu_pct_total:.1f}% "
-            f"rss_peak:{rss:.0f}MiB {load} cuda_mem:{alloc}MiB "
-            f"cuda_reserved:{reserved}MiB cuda_peak:{peak}MiB {cuda_util} {self._nvidia_smi_line()}"
         )
 
 
@@ -5172,15 +4841,6 @@ def train_model(h, device, val_data):
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
     optimizers = Optimizers(h, base_model)
     train_loader = DocumentPackingLoader(h, device)
-    resource_monitor = ResourceMonitor(h, device)
-    log(
-        f"mudskipper_scout:{int(h.mudskipper_scout)} "
-        f"scout_fraction:{h.mudskipper_scout_fraction:.4f} "
-        f"candidate_mult:{h.mudskipper_candidate_mult:.3f} "
-        f"bucket_count:{h.mudskipper_bucket_count} "
-        f"recent_hashes:{h.mudskipper_recent_hashes} "
-        f"nvidia_smi:{int(h.mudskipper_nvidia_smi)}"
-    )
     max_wallclock_ms = (
         1e3 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
     )
@@ -5364,20 +5024,14 @@ def train_model(h, device, val_data):
                 ema_t.mul_(ema_decay).add_(t.detach(), alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
-        should_log_train = (
-            h.train_log_every > 0
-            and (step <= 5 or step % h.train_log_every == 0 or stop_after_step is not None)
-        ) or (
-            h.mudskipper_log_every > 0
-            and (step <= 5 or step % h.mudskipper_log_every == 0 or stop_after_step is not None)
+        should_log_train = h.train_log_every > 0 and (
+            step <= 5 or step % h.train_log_every == 0 or stop_after_step is not None
         )
         if should_log_train:
             tok_per_sec = step * h.train_batch_tokens / (approx_training_time_ms / 1e3)
             log(
                 f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
             )
-            log(train_loader.stats_line(reset=True))
-            log(resource_monitor.snapshot_line())
         reached_cap = (
             forced_stop_step <= 0
             and max_wallclock_ms is not None

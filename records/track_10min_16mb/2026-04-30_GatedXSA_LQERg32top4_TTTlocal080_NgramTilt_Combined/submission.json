@@ -11,7 +11,7 @@
   "lineage": {
     "code_base": "PR #2018 (simon-marcus) — Gated XSA + LQER + token-only in-timer N-gram tilt",
     "quant_tuning": "PR #2060 (S0urC10ud) — 4 of 5 knobs ported: LQER rank=2, asym_group=32, top_k=4, MATRIX_LR=0.028. (TTT_LOCAL_LR_MULT dropped — not honored by PR #2018's train_gpt.py.)",
-    "code_md5_train_gpt_py": "matches PR #2018"
+    "code_md5_train_gpt_py": "PR #2018 code with online n-gram helper inlined into train_gpt.py"
   },
   "artifact_size_bytes_estimate": 15990000,
   "artifact_size_cap_bytes": 16000000,
