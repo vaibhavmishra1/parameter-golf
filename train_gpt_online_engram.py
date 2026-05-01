@@ -100,11 +100,15 @@ class Hyperparameters:
     online_engram_buckets = int(os.environ.get("ONLINE_ENGRAM_BUCKETS", 16_384))
     online_engram_alpha = float(os.environ.get("ONLINE_ENGRAM_ALPHA", 0.02))
     online_engram_alpha_sweep = tuple(
-        float(x) for x in os.environ.get("ONLINE_ENGRAM_ALPHA_SWEEP", "0,0.002,0.005,0.01,0.02,0.04,0.08").split(",") if x
+        float(x)
+        for x in os.environ.get("ONLINE_ENGRAM_ALPHA_SWEEP", "0,0.0001,0.0002,0.0005,0.001,0.002,0.005,0.01,0.02").split(",")
+        if x
     )
     online_engram_min_count = int(os.environ.get("ONLINE_ENGRAM_MIN_COUNT", 2))
     online_engram_conf_tau = float(os.environ.get("ONLINE_ENGRAM_CONF_TAU", 32.0))
     online_engram_prior_tokens = float(os.environ.get("ONLINE_ENGRAM_PRIOR_TOKENS", 256.0))
+    online_engram_min_purity = float(os.environ.get("ONLINE_ENGRAM_MIN_PURITY", 0.55))
+    online_engram_purity_power = float(os.environ.get("ONLINE_ENGRAM_PURITY_POWER", 2.0))
     online_engram_chunk_tokens = int(os.environ.get("ONLINE_ENGRAM_CHUNK_TOKENS", 131_072))
     online_engram_max_tokens = int(os.environ.get("ONLINE_ENGRAM_MAX_TOKENS", 0))
     online_engram_max_table_bytes = int(os.environ.get("ONLINE_ENGRAM_MAX_TABLE_BYTES", 8_000_000_000))
@@ -409,6 +413,10 @@ def eval_val_online_engram(
         raise ValueError("ONLINE_ENGRAM_CONF_TAU must be positive")
     if args.online_engram_prior_tokens < 0.0:
         raise ValueError("ONLINE_ENGRAM_PRIOR_TOKENS must be nonnegative")
+    if args.online_engram_min_purity < 0.0 or args.online_engram_min_purity >= 1.0:
+        raise ValueError("ONLINE_ENGRAM_MIN_PURITY must be in [0, 1)")
+    if args.online_engram_purity_power <= 0.0:
+        raise ValueError("ONLINE_ENGRAM_PURITY_POWER must be positive")
     if args.online_engram_chunk_tokens <= 0 or args.online_engram_max_tokens < 0:
         raise ValueError("ONLINE_ENGRAM_CHUNK_TOKENS must be positive and ONLINE_ENGRAM_MAX_TOKENS nonnegative")
     if not args.online_engram_orders:
@@ -428,7 +436,7 @@ def eval_val_online_engram(
     num_tables = len(orders) * args.online_engram_heads
     table_bytes = (
         num_tables * args.online_engram_buckets * vocab_size * np.dtype(np.uint32).itemsize
-        + num_tables * args.online_engram_buckets * np.dtype(np.uint32).itemsize
+        + 2 * num_tables * args.online_engram_buckets * np.dtype(np.uint32).itemsize
     )
     if table_bytes > args.online_engram_max_table_bytes:
         raise ValueError(
@@ -441,6 +449,7 @@ def eval_val_online_engram(
         dtype=np.uint32,
     )
     totals = np.zeros((num_tables, args.online_engram_buckets), dtype=np.uint32)
+    max_counts = np.zeros((num_tables, args.online_engram_buckets), dtype=np.uint32)
 
     val_np = val_tokens.detach().cpu().numpy().astype(np.int64, copy=False)
     canonical_tokens = engram_canonical_lut[val_np].astype(np.uint32, copy=False)
@@ -505,8 +514,10 @@ def eval_val_online_engram(
                 )
                 table_counts = counts[table_idx]
                 table_totals = totals[table_idx]
+                table_max_counts = max_counts[table_idx]
                 count_before = table_counts[keys, targets].astype(np.uint32, copy=True)
                 total_before = table_totals[keys].astype(np.uint32, copy=True)
+                max_before = table_max_counts[keys].astype(np.uint32, copy=True)
                 if args.online_engram_strict_batch_causal:
                     key_targets = keys.astype(np.uint64) * np.uint64(vocab_size) + targets.astype(np.uint64)
                     count_before += engram_previous_counts(key_targets)
@@ -516,17 +527,28 @@ def eval_val_online_engram(
                 if valid.any():
                     total_f = total_before.astype(np.float64, copy=False)
                     count_f = count_before.astype(np.float64, copy=False)
+                    max_f = max_before.astype(np.float64, copy=False)
                     if prior > 0.0:
                         prob = (count_f + prior * model_prob) / (total_f + prior)
                     else:
                         prob = np.divide(count_f, total_f, out=np.zeros_like(total_f), where=valid)
+                    purity = np.divide(max_f, total_f, out=np.zeros_like(total_f), where=valid)
+                    purity_gate = np.clip(
+                        (purity - args.online_engram_min_purity) / (1.0 - args.online_engram_min_purity),
+                        0.0,
+                        1.0,
+                    )
                     conf = np.zeros_like(total_f)
-                    conf[valid] = 1.0 - np.exp(-total_f[valid] / max(args.online_engram_conf_tau, 1e-9))
+                    conf[valid] = (
+                        (1.0 - np.exp(-total_f[valid] / max(args.online_engram_conf_tau, 1e-9)))
+                        * np.power(purity_gate[valid], args.online_engram_purity_power)
+                    )
                     mem_prob_weighted += conf * prob
                     mem_weight += conf
 
                 np.add.at(table_counts, (keys, targets), 1)
                 np.add.at(table_totals, keys, 1)
+                np.maximum.at(table_max_counts, keys, table_counts[keys, targets])
                 table_idx += 1
 
             mem_prob = np.divide(mem_prob_weighted, mem_weight, out=model_prob.copy(), where=mem_weight > 0)
@@ -1145,11 +1167,15 @@ def main() -> None:
         f"heads:{args.online_engram_heads} buckets:{args.online_engram_buckets} "
         f"alpha:{args.online_engram_alpha} alpha_sweep:{','.join(f'{a:g}' for a in args.online_engram_alpha_sweep)} "
         f"min_count:{args.online_engram_min_count} prior_tokens:{args.online_engram_prior_tokens:g} "
+        f"min_purity:{args.online_engram_min_purity:g} purity_power:{args.online_engram_purity_power:g} "
         f"strict_batch_causal:{args.online_engram_strict_batch_causal} "
         f"canonical_ids:{int(engram_canonical_lut.max()) + 1} "
-        f"table_bytes:{(len(set(args.online_engram_orders)) * args.online_engram_heads * args.online_engram_buckets * (args.vocab_size + 1) * np.dtype(np.uint32).itemsize):,}"
+        f"table_bytes:{(len(set(args.online_engram_orders)) * args.online_engram_heads * args.online_engram_buckets * (args.vocab_size + 2) * np.dtype(np.uint32).itemsize):,}"
     )
-    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+    if args.validate_only:
+        log0("train_loader:skipped_validate_only")
+    else:
+        log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
