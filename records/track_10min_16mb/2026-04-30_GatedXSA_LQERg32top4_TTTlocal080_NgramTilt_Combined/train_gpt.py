@@ -1148,7 +1148,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 40000))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
