@@ -98,9 +98,13 @@ class Hyperparameters:
     )
     online_engram_heads = int(os.environ.get("ONLINE_ENGRAM_HEADS", 2))
     online_engram_buckets = int(os.environ.get("ONLINE_ENGRAM_BUCKETS", 16_384))
-    online_engram_alpha = float(os.environ.get("ONLINE_ENGRAM_ALPHA", 0.08))
+    online_engram_alpha = float(os.environ.get("ONLINE_ENGRAM_ALPHA", 0.02))
+    online_engram_alpha_sweep = tuple(
+        float(x) for x in os.environ.get("ONLINE_ENGRAM_ALPHA_SWEEP", "0,0.002,0.005,0.01,0.02,0.04,0.08").split(",") if x
+    )
     online_engram_min_count = int(os.environ.get("ONLINE_ENGRAM_MIN_COUNT", 2))
     online_engram_conf_tau = float(os.environ.get("ONLINE_ENGRAM_CONF_TAU", 32.0))
+    online_engram_prior_tokens = float(os.environ.get("ONLINE_ENGRAM_PRIOR_TOKENS", 256.0))
     online_engram_chunk_tokens = int(os.environ.get("ONLINE_ENGRAM_CHUNK_TOKENS", 131_072))
     online_engram_max_tokens = int(os.environ.get("ONLINE_ENGRAM_MAX_TOKENS", 0))
     online_engram_max_table_bytes = int(os.environ.get("ONLINE_ENGRAM_MAX_TABLE_BYTES", 8_000_000_000))
@@ -390,7 +394,7 @@ def eval_val_online_engram(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
     engram_canonical_lut: np.ndarray,
-) -> tuple[float, float, float, float] | None:
+) -> tuple[float, float, list[tuple[float, float, float]]] | None:
     # This is intentionally rank-0 only so the online memory sees the validation
     # stream in canonical order. Nonzero ranks wait at the caller's barrier.
     if rank != 0:
@@ -403,10 +407,18 @@ def eval_val_online_engram(
         raise ValueError("ONLINE_ENGRAM_MIN_COUNT must be at least 1")
     if args.online_engram_conf_tau <= 0.0:
         raise ValueError("ONLINE_ENGRAM_CONF_TAU must be positive")
+    if args.online_engram_prior_tokens < 0.0:
+        raise ValueError("ONLINE_ENGRAM_PRIOR_TOKENS must be nonnegative")
     if args.online_engram_chunk_tokens <= 0 or args.online_engram_max_tokens < 0:
         raise ValueError("ONLINE_ENGRAM_CHUNK_TOKENS must be positive and ONLINE_ENGRAM_MAX_TOKENS nonnegative")
     if not args.online_engram_orders:
         raise ValueError("ONLINE_ENGRAM_ORDERS must contain at least one order")
+    alpha_values = list(args.online_engram_alpha_sweep)
+    if not any(abs(alpha - args.online_engram_alpha) < 1e-12 for alpha in alpha_values):
+        alpha_values.append(args.online_engram_alpha)
+    alpha_values = sorted(set(alpha_values))
+    if not alpha_values or any(alpha < 0.0 or alpha > 1.0 for alpha in alpha_values):
+        raise ValueError(f"Online Engram alphas must be in [0, 1], got {alpha_values}")
 
     vocab_size = args.vocab_size
     orders = tuple(sorted(set(args.online_engram_orders)))
@@ -446,7 +458,7 @@ def eval_val_online_engram(
     chunk_seqs = max(args.online_engram_chunk_tokens // args.train_seq_len, 1)
     total_seqs = total_targets // args.train_seq_len
     normal_nll_sum = 0.0
-    engram_nll_sum = 0.0
+    engram_nll_sums = np.zeros((len(alpha_values),), dtype=np.float64)
     byte_count = 0.0
     token_count = 0
     sentinel = int(engram_canonical_lut.max()) + 1
@@ -479,6 +491,7 @@ def eval_val_online_engram(
 
             mem_prob_weighted = np.zeros((n,), dtype=np.float64)
             mem_weight = np.zeros((n,), dtype=np.float64)
+            prior = args.online_engram_prior_tokens
             table_idx = 0
             for order, head in table_specs:
                 keys = engram_hash_keys(
@@ -503,7 +516,10 @@ def eval_val_online_engram(
                 if valid.any():
                     total_f = total_before.astype(np.float64, copy=False)
                     count_f = count_before.astype(np.float64, copy=False)
-                    prob = np.divide(count_f, total_f, out=np.zeros_like(total_f), where=valid)
+                    if prior > 0.0:
+                        prob = (count_f + prior * model_prob) / (total_f + prior)
+                    else:
+                        prob = np.divide(count_f, total_f, out=np.zeros_like(total_f), where=valid)
                     conf = np.zeros_like(total_f)
                     conf[valid] = 1.0 - np.exp(-total_f[valid] / max(args.online_engram_conf_tau, 1e-9))
                     mem_prob_weighted += conf * prob
@@ -513,21 +529,26 @@ def eval_val_online_engram(
                 np.add.at(table_totals, keys, 1)
                 table_idx += 1
 
-            mem_prob = np.divide(mem_prob_weighted, mem_weight, out=np.zeros_like(mem_prob_weighted), where=mem_weight > 0)
-            mix = args.online_engram_alpha * np.clip(mem_weight / float(num_tables), 0.0, 1.0)
-            final_prob = (1.0 - mix) * model_prob + mix * mem_prob
-            engram_nll_sum += float((-np.log(np.maximum(final_prob, 1e-30))).sum())
+            mem_prob = np.divide(mem_prob_weighted, mem_weight, out=model_prob.copy(), where=mem_weight > 0)
+            base_mix = np.clip(mem_weight / float(num_tables), 0.0, 1.0)
+            for alpha_idx, alpha in enumerate(alpha_values):
+                mix = alpha * base_mix
+                final_prob = (1.0 - mix) * model_prob + mix * mem_prob
+                engram_nll_sums[alpha_idx] += float((-np.log(np.maximum(final_prob, 1e-30))).sum())
             token_count += n
 
     if was_training:
         model.train()
 
     normal_loss = normal_nll_sum / token_count
-    engram_loss = engram_nll_sum / token_count
     tokens_per_byte = token_count / byte_count
     normal_bpb = normal_loss / math.log(2.0) * tokens_per_byte
-    engram_bpb = engram_loss / math.log(2.0) * tokens_per_byte
-    return normal_loss, normal_bpb, engram_loss, engram_bpb
+    alpha_results = []
+    for alpha, engram_nll_sum in zip(alpha_values, engram_nll_sums, strict=True):
+        engram_loss = float(engram_nll_sum / token_count)
+        engram_bpb = engram_loss / math.log(2.0) * tokens_per_byte
+        alpha_results.append((float(alpha), engram_loss, float(engram_bpb)))
+    return normal_loss, normal_bpb, alpha_results
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1040,6 +1061,49 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
+    def log_online_engram_result(
+        prefix: str,
+        online_result: tuple[float, float, list[tuple[float, float, float]]] | None,
+        ref_normal_loss: float,
+        ref_normal_bpb: float,
+        elapsed_ms: float,
+    ) -> None:
+        if online_result is None:
+            return
+        online_normal_loss, online_normal_bpb, alpha_results = online_result
+        selected_alpha, selected_loss, selected_bpb = min(
+            alpha_results,
+            key=lambda item: abs(item[0] - args.online_engram_alpha),
+        )
+        best_alpha, best_loss, best_bpb = min(alpha_results, key=lambda item: item[2])
+        log0(
+            f"{prefix} ref_normal_val_bpb:{ref_normal_bpb:.4f} "
+            f"online_normal_val_bpb:{online_normal_bpb:.4f} "
+            f"selected_alpha:{selected_alpha:g} engram_val_bpb:{selected_bpb:.4f} "
+            f"delta_vs_ref:{selected_bpb - ref_normal_bpb:+.4f} "
+            f"delta_vs_online:{selected_bpb - online_normal_bpb:+.4f} "
+            f"best_alpha:{best_alpha:g} best_engram_val_bpb:{best_bpb:.4f} "
+            f"best_delta_vs_ref:{best_bpb - ref_normal_bpb:+.4f} "
+            f"eval_time:{elapsed_ms:.0f}ms"
+        )
+        log0(
+            f"{prefix}_exact ref_normal_val_loss:{ref_normal_loss:.8f} "
+            f"ref_normal_val_bpb:{ref_normal_bpb:.8f} "
+            f"online_normal_val_loss:{online_normal_loss:.8f} "
+            f"online_normal_val_bpb:{online_normal_bpb:.8f} "
+            f"selected_alpha:{selected_alpha:g} "
+            f"engram_val_loss:{selected_loss:.8f} engram_val_bpb:{selected_bpb:.8f} "
+            f"delta_vs_ref:{selected_bpb - ref_normal_bpb:+.8f} "
+            f"delta_vs_online:{selected_bpb - online_normal_bpb:+.8f} "
+            f"best_alpha:{best_alpha:g} best_engram_val_loss:{best_loss:.8f} "
+            f"best_engram_val_bpb:{best_bpb:.8f} best_delta_vs_ref:{best_bpb - ref_normal_bpb:+.8f}"
+        )
+        sweep = " ".join(
+            f"a={alpha:g}:bpb={bpb:.8f}:d_ref={bpb - ref_normal_bpb:+.8f}:d_online={bpb - online_normal_bpb:+.8f}"
+            for alpha, _, bpb in alpha_results
+        )
+        log0(f"{prefix}_sweep {sweep}")
+
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1079,7 +1143,8 @@ def main() -> None:
         "online_engram:"
         f"enabled:{args.online_engram_enabled} orders:{','.join(map(str, args.online_engram_orders))} "
         f"heads:{args.online_engram_heads} buckets:{args.online_engram_buckets} "
-        f"alpha:{args.online_engram_alpha} min_count:{args.online_engram_min_count} "
+        f"alpha:{args.online_engram_alpha} alpha_sweep:{','.join(f'{a:g}' for a in args.online_engram_alpha_sweep)} "
+        f"min_count:{args.online_engram_min_count} prior_tokens:{args.online_engram_prior_tokens:g} "
         f"strict_batch_causal:{args.online_engram_strict_batch_causal} "
         f"canonical_ids:{int(engram_canonical_lut.max()) + 1} "
         f"table_bytes:{(len(set(args.online_engram_orders)) * args.online_engram_heads * args.online_engram_buckets * (args.vocab_size + 1) * np.dtype(np.uint32).itemsize):,}"
@@ -1159,21 +1224,13 @@ def main() -> None:
                 engram_canonical_lut,
             )
             torch.cuda.synchronize()
-            if online_result is not None:
-                online_normal_loss, online_normal_bpb, online_engram_loss, online_engram_bpb = online_result
-                log0(
-                    f"validate_only_online_engram normal_val_loss:{online_normal_loss:.4f} "
-                    f"normal_val_bpb:{online_normal_bpb:.4f} "
-                    f"engram_val_loss:{online_engram_loss:.4f} engram_val_bpb:{online_engram_bpb:.4f} "
-                    f"delta_bpb:{online_engram_bpb - online_normal_bpb:+.4f} "
-                    f"eval_time:{1000.0 * (time.perf_counter() - t_engram):.0f}ms"
-                )
-                log0(
-                    f"validate_only_online_engram_exact normal_val_loss:{online_normal_loss:.8f} "
-                    f"normal_val_bpb:{online_normal_bpb:.8f} "
-                    f"engram_val_loss:{online_engram_loss:.8f} engram_val_bpb:{online_engram_bpb:.8f} "
-                    f"delta_bpb:{online_engram_bpb - online_normal_bpb:+.8f}"
-                )
+            log_online_engram_result(
+                "validate_only_online_engram",
+                online_result,
+                normal_val_loss,
+                normal_val_bpb,
+                1000.0 * (time.perf_counter() - t_engram),
+            )
             if distributed:
                 dist.barrier()
         if distributed:
@@ -1470,21 +1527,13 @@ def main() -> None:
             engram_canonical_lut,
         )
         torch.cuda.synchronize()
-        if online_result is not None:
-            online_normal_loss, online_normal_bpb, online_engram_loss, online_engram_bpb = online_result
-            log0(
-                f"final_online_engram normal_val_loss:{online_normal_loss:.4f} "
-                f"normal_val_bpb:{online_normal_bpb:.4f} "
-                f"engram_val_loss:{online_engram_loss:.4f} engram_val_bpb:{online_engram_bpb:.4f} "
-                f"delta_bpb:{online_engram_bpb - online_normal_bpb:+.4f} "
-                f"eval_time:{1000.0 * (time.perf_counter() - t_engram):.0f}ms"
-            )
-            log0(
-                f"final_online_engram_exact normal_val_loss:{online_normal_loss:.8f} "
-                f"normal_val_bpb:{online_normal_bpb:.8f} "
-                f"engram_val_loss:{online_engram_loss:.8f} engram_val_bpb:{online_engram_bpb:.8f} "
-                f"delta_bpb:{online_engram_bpb - online_normal_bpb:+.8f}"
-            )
+        log_online_engram_result(
+            "final_online_engram",
+            online_result,
+            q_val_loss,
+            q_val_bpb,
+            1000.0 * (time.perf_counter() - t_engram),
+        )
         if distributed:
             dist.barrier()
 
