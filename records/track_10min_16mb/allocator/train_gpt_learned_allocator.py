@@ -93,6 +93,14 @@ class Hyperparameters:
     alloc_alpha = float(os.environ.get("ALLOC_ALPHA", 0.10))
     alloc_warmup_steps = int(os.environ.get("ALLOC_WARMUP_STEPS", 300))
     alloc_aux_weight = float(os.environ.get("ALLOC_AUX_WEIGHT", 0.01))
+    alloc_target = os.environ.get("ALLOC_TARGET", "loss")
+    alloc_local_radius = int(os.environ.get("ALLOC_LOCAL_RADIUS", 1))
+    alloc_adv_local = float(os.environ.get("ALLOC_ADV_LOCAL", 0.50))
+    alloc_adv_batch = float(os.environ.get("ALLOC_ADV_BATCH", 0.50))
+    alloc_confidence = bool(int(os.environ.get("ALLOC_CONFIDENCE", "0")))
+    alloc_conf_floor = float(os.environ.get("ALLOC_CONF_FLOOR", 0.25))
+    alloc_conf_threshold = float(os.environ.get("ALLOC_CONF_THRESHOLD", 0.50))
+    alloc_conf_aux_weight = float(os.environ.get("ALLOC_CONF_AUX_WEIGHT", 0.002))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -673,6 +681,14 @@ def span_mean_3d(x: Tensor, span_size: int) -> Tensor:
     return x[:, : num_spans * span_size].reshape(batch_size, num_spans, span_size, width).mean(dim=2)
 
 
+def local_span_mean(x: Tensor, radius: int) -> Tensor:
+    if radius <= 0:
+        return x
+    width = 2 * radius + 1
+    padded = F.pad(x[:, None, :], (radius, radius), mode="replicate")
+    return F.avg_pool1d(padded, kernel_size=width, stride=1).squeeze(1)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -692,6 +708,14 @@ class GPT(nn.Module):
         alloc_alpha: float,
         alloc_warmup_steps: int,
         alloc_aux_weight: float,
+        alloc_target: str,
+        alloc_local_radius: int,
+        alloc_adv_local: float,
+        alloc_adv_batch: float,
+        alloc_confidence: bool,
+        alloc_conf_floor: float,
+        alloc_conf_threshold: float,
+        alloc_conf_aux_weight: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -704,6 +728,14 @@ class GPT(nn.Module):
         self.alloc_alpha = alloc_alpha
         self.alloc_warmup_steps = max(0, alloc_warmup_steps)
         self.alloc_aux_weight = alloc_aux_weight
+        self.alloc_target = alloc_target
+        self.alloc_local_radius = max(0, alloc_local_radius)
+        self.alloc_adv_local = alloc_adv_local
+        self.alloc_adv_batch = alloc_adv_batch
+        self.alloc_confidence = alloc_confidence
+        self.alloc_conf_floor = alloc_conf_floor
+        self.alloc_conf_threshold = alloc_conf_threshold
+        self.alloc_conf_aux_weight = alloc_conf_aux_weight
         self.register_buffer("alloc_step", torch.zeros((), dtype=torch.int32), persistent=False)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
@@ -727,14 +759,16 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        self.allocator_head = CastedLinear(model_dim, 1, bias=False) if alloc_enabled else None
+        # Always instantiate the head so ALLOC_ENABLED is a clean behavior switch,
+        # not a model-shape/RNG switch. The second output is used only when
+        # ALLOC_CONFIDENCE=1.
+        self.allocator_head = CastedLinear(model_dim, 2, bias=False)
         self._init_weights()
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        if self.allocator_head is not None:
-            nn.init.normal_(self.allocator_head.weight, mean=0.0, std=0.001)
+        nn.init.normal_(self.allocator_head.weight, mean=0.0, std=0.001)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -770,21 +804,44 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         ce_tok = F.cross_entropy(logits.float(), targets, reduction="none").view(batch_size, seq_len)
-        if not self.training or not self.alloc_enabled or self.allocator_head is None:
+        if not self.training:
             return ce_tok.mean()
 
         span_loss = span_mean_2d(ce_tok, self.alloc_span_size)
         span_hidden = span_mean_3d(hidden.detach(), self.alloc_span_size)
-        score = self.allocator_head(span_hidden).squeeze(-1).float()
+        alloc_out = self.allocator_head(span_hidden).float()
+        if not self.alloc_enabled:
+            return ce_tok.mean() + 0.0 * alloc_out.sum()
+
+        score = alloc_out[..., 0]
+        conf_logit = alloc_out[..., 1]
         score_z = zscore_batch(score)
-        target_z = zscore_batch(span_loss.detach())
+        if self.alloc_target == "advantage":
+            span_target = span_loss.detach()
+            local_mean = local_span_mean(span_target, self.alloc_local_radius)
+            local_advantage = span_target - local_mean
+            target = self.alloc_adv_batch * zscore_batch(span_target) + self.alloc_adv_local * zscore_batch(local_advantage)
+        elif self.alloc_target == "loss":
+            target = span_loss.detach()
+        else:
+            raise ValueError(f"Unknown ALLOC_TARGET={self.alloc_target!r}; expected 'loss' or 'advantage'")
+        target_z = zscore_batch(target)
         allocator_loss = F.mse_loss(score_z, target_z)
 
+        if self.alloc_confidence:
+            confidence = self.alloc_conf_floor + (1.0 - self.alloc_conf_floor) * torch.sigmoid(conf_logit.float())
+            conf_target = torch.sigmoid(target_z.detach().abs() - self.alloc_conf_threshold)
+            confidence_loss = F.mse_loss(torch.sigmoid(conf_logit.float()), conf_target)
+        else:
+            confidence = torch.ones_like(score_z)
+            confidence_loss = score_z.new_zeros(())
+
         active = (self.alloc_step >= self.alloc_warmup_steps).to(dtype=span_loss.dtype)
-        weights = 1.0 + active * self.alloc_alpha * torch.tanh(score_z.detach())
+        weight_delta = self.alloc_alpha * confidence.detach() * torch.tanh(score_z.detach())
+        weights = 1.0 + active * weight_delta
         weights = weights / weights.mean().clamp_min(1e-6)
         main_loss = (weights * span_loss).mean()
-        return main_loss + self.alloc_aux_weight * allocator_loss
+        return main_loss + self.alloc_aux_weight * allocator_loss + self.alloc_conf_aux_weight * confidence_loss
 
 
 # -----------------------------
@@ -903,6 +960,14 @@ def main() -> None:
         alloc_alpha=args.alloc_alpha,
         alloc_warmup_steps=args.alloc_warmup_steps,
         alloc_aux_weight=args.alloc_aux_weight,
+        alloc_target=args.alloc_target,
+        alloc_local_radius=args.alloc_local_radius,
+        alloc_adv_local=args.alloc_adv_local,
+        alloc_adv_batch=args.alloc_adv_batch,
+        alloc_confidence=args.alloc_confidence,
+        alloc_conf_floor=args.alloc_conf_floor,
+        alloc_conf_threshold=args.alloc_conf_threshold,
+        alloc_conf_aux_weight=args.alloc_conf_aux_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -986,7 +1051,11 @@ def main() -> None:
     log0(
         f"allocator_variant:learned_span enabled:{args.alloc_enabled} span:{args.alloc_span_size} "
         f"alpha:{args.alloc_alpha} allocator_warmup:{args.alloc_warmup_steps} "
-        f"aux_weight:{args.alloc_aux_weight}"
+        f"aux_weight:{args.alloc_aux_weight} target:{args.alloc_target} "
+        f"local_radius:{args.alloc_local_radius} adv_local:{args.alloc_adv_local} "
+        f"adv_batch:{args.alloc_adv_batch} confidence:{args.alloc_confidence} "
+        f"conf_floor:{args.alloc_conf_floor} conf_threshold:{args.alloc_conf_threshold} "
+        f"conf_aux_weight:{args.alloc_conf_aux_weight}"
     )
     log0(f"seed:{args.seed}")
 

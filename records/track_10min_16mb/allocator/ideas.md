@@ -34,6 +34,14 @@ ALLOC_USE_ENTROPY=0   # 0 = span CE, 1 = token entropy
 
 # train_gpt_learned_allocator.py
 ALLOC_AUX_WEIGHT=0.01
+ALLOC_TARGET=loss          # loss or advantage
+ALLOC_LOCAL_RADIUS=1       # neighbor span radius for advantage target
+ALLOC_ADV_BATCH=0.50       # batch-relative loss mix for advantage target
+ALLOC_ADV_LOCAL=0.50       # local surprise mix for advantage target
+ALLOC_CONFIDENCE=0         # 1 enables score confidence gating
+ALLOC_CONF_FLOOR=0.25
+ALLOC_CONF_THRESHOLD=0.50
+ALLOC_CONF_AUX_WEIGHT=0.002
 
 # train_gpt_gradient_allocator.py
 ALLOC_AUX_WEIGHT=0.01
